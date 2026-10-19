@@ -1,109 +1,106 @@
-"""Candidate worker: runs the brick under evaluation, inside the sandbox.
+"""Brick worker: runs one brick's run() for each case the parent sends, inside the sandbox.
 
-Input (stdin): {"brick", "cases": [{"input", "exchanges": [...]}]}
-Output: {"results": [{"output" | "error" | "out_of_evidence", "mismatches", "regenerated"}]}
+The parent starts it with the workspace path as argument and sends JSON lines:
 
-For each case the worker installs a replay io in the framework runtime:
+    {"brick": "<name>"}                       first line: which brick to load
+    {"op": "case", "input": {...}}            run once
+    {"op": "exit"}
 
-- an external call returns the recorded response, or the case is out of evidence;
-- a sibling call returns the recorded response when one was stored (a
-  nondeterministic sibling); a deterministic sibling is computed again and
-  checked against its recorded hash; a nondeterministic sibling with no
-  record for this request (its contract or the request changed) is
-  regenerated and reported, so the runner can store the new record.
+For every io call the brick makes, the worker asks the parent and waits:
 
-This process never sees the scorer: build() and score() run in another process.
+    worker -> {"op": "external", "name", "request"}  /  {"op": "sibling", "brick", "request"}
+    parent -> {"response": ...}  or  {"raise": "out_of_evidence" | "error", "message": ...}
+
+When a case ends the worker sends {"op": "done", "output": ...} or {"op": "done", "error": {...}}.
+
+The replay data, the out-of-evidence decision, sibling calls and the
+determinism check all live in the parent. Nothing this process reports
+about io is trusted; it only reports outputs.
 """
 
 from __future__ import annotations
 
 import importlib
 import json
+import os
 from pathlib import Path
 import sys
 import traceback
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import finish, start  # noqa: E402
+from _common import guard  # noqa: E402
 
 
-class RecordedError(RuntimeError):
-    """The recorded call failed; the replay fails the same way."""
+class Channel:
+    def __init__(self) -> None:
+        self.inbox = sys.stdin
+        self.outbox = os.fdopen(os.dup(1), "w", encoding="utf-8")
+        sys.stdout = sys.stderr  # anything the brick prints goes to the log
+
+    def send(self, message: dict) -> None:
+        self.outbox.write(json.dumps(message) + "\n")
+        self.outbox.flush()
+
+    def receive(self) -> dict:
+        line = self.inbox.readline()
+        if not line:
+            raise SystemExit(0)
+        return json.loads(line)
 
 
-class Replay:
-    def __init__(self, exchanges: list[dict], runtime) -> None:
+class RemoteError(RuntimeError):
+    """A replayed call failed the way it failed when it was recorded, or a sibling failed."""
+
+
+class BrokerIO:
+    def __init__(self, channel: Channel, runtime) -> None:
+        self.channel = channel
         self.runtime = runtime
-        self.table: dict[tuple[str, str], list[dict]] = {}
-        for exchange in exchanges:
-            self.table.setdefault((exchange["name"], exchange["request_hash"]), []).append(exchange)
-        self.used: dict[tuple[str, str], int] = {}
-        self.mismatches: list[dict] = []
-        self.regenerated: list[dict] = []
 
-    def _take(self, key: tuple[str, str]) -> dict | None:
-        records = self.table.get(key)
-        if not records:
-            return None
-        index = self.used.get(key, 0)
-        self.used[key] = index + 1
-        return records[min(index, len(records) - 1)]
+    def _ask(self, message: dict):
+        self.channel.send(message)
+        reply = self.channel.receive()
+        if "raise" in reply:
+            if reply["raise"] == "out_of_evidence":
+                raise self.runtime.OutOfEvidence(reply.get("message", ""))
+            raise RemoteError(reply.get("message", ""))
+        return reply["response"]
 
     def external(self, name, request, call):
-        record = self._take((f"external:{name}", self.runtime.digest(request)))
-        if record is None:
-            raise self.runtime.OutOfEvidence(f"no recorded response for external:{name}")
-        if "error" in record:
-            raise RecordedError(f"{record['error'].get('type')}: {record['error'].get('message')}")
-        return record["response"]
+        return self._ask({"op": "external", "name": name, "request": request})
 
     def sibling(self, brick, request, call):
-        name = f"sibling:{brick}"
-        record = self._take((name, self.runtime.digest(request)))
-        if record is not None and "response" in record:
-            return record["response"]
-        if record is not None and "error" in record:
-            raise RecordedError(f"{record['error'].get('type')}: {record['error'].get('message')}")
-        response = call(request)
-        if self.runtime.is_deterministic(brick):
-            expected = record.get("response_hash") if record else None
-            if expected and self.runtime.digest(response) != expected:
-                self.mismatches.append({"name": name, "expected": expected, "actual": self.runtime.digest(response)})
-        else:
-            self.regenerated.append({"name": name, "request": request, "response": response})
-        return response
+        return self._ask({"op": "sibling", "brick": brick, "request": request})
 
 
 def main() -> None:
-    payload, stream = start()
+    channel = Channel()
+    sys.addaudithook(guard)
     workspace = Path(sys.argv[1])
     sys.path.insert(0, str(workspace))
+    first = channel.receive()
     try:
         from bricks import _runtime
-        run = importlib.import_module(f"bricks.{payload['brick']}").run
+        run = importlib.import_module(f"bricks.{first['brick']}").run
     except Exception:
-        finish(stream, {"fatal": "cannot import the brick:\n" + traceback.format_exc(limit=5)})
+        channel.send({"op": "fatal", "message": "cannot import the brick:\n" + traceback.format_exc(limit=5)})
         return
-    results = []
-    for case in payload["cases"]:
-        replay = Replay(case.get("exchanges", []), _runtime)
-        token = _runtime.use_io(replay)
-        result: dict = {}
+    channel.send({"op": "ready"})
+    io = BrokerIO(channel, _runtime)
+    while True:
+        message = channel.receive()
+        if message.get("op") != "case":
+            return
+        token = _runtime.use_io(io)
         try:
-            output = run(case["input"])
+            output = run(message["input"])
             json.dumps(output)
-            result["output"] = output
-        except _runtime.OutOfEvidence as exc:
-            result["out_of_evidence"] = str(exc)
+            channel.send({"op": "done", "output": output})
         except Exception as exc:
-            result["error"] = {"type": type(exc).__name__, "message": str(exc)[:500],
-                               "traceback": traceback.format_exc(limit=8)[-2000:]}
+            channel.send({"op": "done", "error": {"type": type(exc).__name__, "message": str(exc)[:500],
+                                                  "traceback": traceback.format_exc(limit=8)[-2000:]}})
         finally:
             _runtime._io.reset(token)
-        result["mismatches"] = replay.mismatches
-        result["regenerated"] = replay.regenerated
-        results.append(result)
-    finish(stream, {"results": results})
 
 
 if __name__ == "__main__":

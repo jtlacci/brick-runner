@@ -107,8 +107,73 @@ class Scenario(unittest.TestCase):
         view = self.runner.submit("signal", commit, "development")
         self.assertFalse(view["passed"])
         self.assertEqual(view["counts"]["run_errors"], view["counts"]["cases"])
-        if sandbox.network_isolation():
-            self.assertTrue(view["network_isolated"])
+        self.assertTrue(view["sandboxed"])
+
+    # ---- attacks a candidate might try (from the independent review)
+
+    def test_09a_candidate_cannot_rewrite_its_scorer(self) -> None:
+        targets = [str(self.tmp), "/tmp", "/mnt", str(self.root)]
+        tamper = (
+            "import os\n\n"
+            f"for top in {targets!r}:\n"
+            "    for dirpath, dirs, files in os.walk(top):\n"
+            "        if 'evaluate.py' in files:\n"
+            "            try:\n"
+            "                with open(os.path.join(dirpath, 'evaluate.py'), 'w') as f:\n"
+            "                    f.write(\"GATES = ()\\ndef build(r): return r['input']\\n"
+            "def score(r, o, l): return {'accuracy': 1.0}\\ndef generate(s): return []\\n\")\n"
+            "            except OSError:\n"
+            "                pass\n\n\n"
+            "def execute(inputs, ctx):\n"
+            "    return {'action': 'hold'}\n"
+        )
+        commit = self.branch("tamper", {"bricks/signal/src/logic.py": tamper})
+        view = self.runner.submit("signal", commit, "development")
+        self.assertFalse(view["passed"], view)
+        self.assertLess(view["terms"]["accuracy"], 0.95)
+        self.assertIn("score(", (self.root / "bricks/signal/evaluation/evaluate.py").read_text())
+
+    def test_09b_candidate_cannot_read_the_runner_state(self) -> None:
+        key = (self.tmp / "home/runner.key").read_bytes().hex()
+        spy = (
+            "import os, sys\n\n"
+            f"for path in [{str(self.tmp / 'home/runner.key')!r}, {str(self.tmp / 'home/mlflow.db')!r}]:\n"
+            "    try:\n"
+            "        print('LEAK', open(path, 'rb').read().hex(), file=sys.stderr)\n"
+            "    except OSError as exc:\n"
+            "        print('BLOCKED', type(exc).__name__, file=sys.stderr)\n\n\n"
+            "def execute(inputs, ctx):\n"
+            "    return {'action': 'hold'}\n"
+        )
+        commit = self.branch("spy", {"bricks/signal/src/logic.py": spy})
+        view = self.runner.submit("signal", commit, "development")
+        self.assertNotIn(key, view["log"])
+        self.assertNotIn("LEAK", view["log"])
+        self.assertIn("BLOCKED", view["log"])
+
+    def test_09c_candidate_cannot_declare_its_own_cases_out_of_evidence(self) -> None:
+        fake = fixture.SIGNAL_CORRECT.replace(
+            "from ..input.adapters import market_data",
+            "from bricks import _runtime\n    from ..input.adapters import market_data").replace(
+            'return {"action": "buy"}', 'raise _runtime.OutOfEvidence("skip the hard case")')
+        commit = self.branch("fake-ooe", {"bricks/signal/src/logic.py": fake})
+        view = self.runner.submit("signal", commit, "development")
+        self.assertEqual(view["counts"]["out_of_evidence"], 0)
+        self.assertGreater(view["counts"]["run_errors"], 0)
+        self.assertFalse(view["passed"])
+
+    def test_09d_skipping_hard_cases_through_unrecorded_requests_fails(self) -> None:
+        skip = fixture.SIGNAL_CORRECT.replace(
+            '        if price < inputs["threshold"]:\n            return {"action": "buy"}',
+            '        if price < inputs["threshold"]:\n'
+            '            market_data.latest_price(inputs["symbol"] + "-NEVER", ctx)\n'
+            '            return {"action": "buy"}')
+        self.assertNotEqual(skip, fixture.SIGNAL_CORRECT)
+        commit = self.branch("skip-hard", {"bricks/signal/src/logic.py": skip})
+        view = self.runner.submit("signal", commit, "development")
+        self.assertGreater(view["counts"]["out_of_evidence"], 0)
+        self.assertFalse(view["passed"])
+        self.assertTrue(any("out of evidence" in r for r in view["reasons"]))
 
     def test_10_capture_ingest_pin_and_replay_real_data(self) -> None:
         spool = self.tmp / "spool"
@@ -141,6 +206,8 @@ class Scenario(unittest.TestCase):
         self.assertEqual(view["counts"]["regenerated"], 0)
         self.assertEqual(view["counts"]["out_of_evidence"], view["counts"]["cases"])
         self.assertFalse(view["passed"])
+        # Nothing a candidate run produces is ever stored as evidence.
+        self.assertEqual(list(self.runner.store.query(source="regenerated")), [])
 
     def test_11_holdout_is_refused_without_validation(self) -> None:
         with self.assertRaises(RunnerError):

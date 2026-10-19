@@ -1,24 +1,52 @@
-"""Run a worker script in a sandbox: no network, a clean environment, a time limit.
+"""Sandboxed worker processes.
 
-Network isolation uses a new network namespace (``unshare --net``) when the
-host allows it. The workers also install an audit hook that refuses sockets
-and subprocesses, as a second layer. The result says whether the namespace
-was available.
+Each worker runs in new user, network and mount namespaces:
+
+- no network;
+- its own workspace copy, mounted at /mnt, is the only tree it works in;
+- /tmp, the runner's state folder and the brick repository are hidden behind
+  empty tmpfs mounts, so a worker cannot read the signing key, the store, the
+  ledger or another worker's workspace;
+- the Python environment and the worker scripts are mounted read-only.
+
+The workers also install an audit hook that refuses sockets and subprocesses.
+Without namespaces the runner refuses to run, unless BRICK_RUNNER_UNSANDBOXED=1
+is set (for development hosts only; results then say so).
 """
 
 from __future__ import annotations
 
 import functools
 import json
+import os
 from pathlib import Path
+import queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from typing import Any
 
 WORKERS = Path(__file__).resolve().parent / "workers"
 MARKER = "\x1ebrick-runner-result\x1e"
+MOUNT_POINT = "/mnt"
+WRAPPER = r'''
+set -e
+ws="$1"; shift
+mount --rbind "$ws" /mnt
+while [ "$1" != "--" ]; do
+  case "$1" in
+    ro:*) p="${1#ro:}"; if [ -d "$p" ]; then mount --bind "$p" "$p"; mount -o remount,bind,ro "$p"; fi ;;
+    hide:*) p="${1#hide:}"; if [ -d "$p" ]; then mount -t tmpfs -o size=4m tmpfs "$p"; fi ;;
+  esac
+  shift
+done
+shift
+cd /mnt
+exec "$@"
+'''
 
 
 class SandboxError(RuntimeError):
@@ -28,36 +56,143 @@ class SandboxError(RuntimeError):
 
 
 @functools.lru_cache(maxsize=1)
-def network_isolation() -> bool:
+def isolation() -> bool:
     if not shutil.which("unshare"):
         return False
     try:
-        return subprocess.run(["unshare", "--net", "--map-root-user", "true"],
-                              capture_output=True, timeout=10).returncode == 0
+        probe = subprocess.run(
+            ["unshare", "--net", "--mount", "--map-root-user", "--propagation", "private",
+             "sh", "-c", "mount -t tmpfs tmpfs /mnt && mount --bind /mnt /mnt && mount -o remount,bind,ro /mnt"],
+            capture_output=True, timeout=10)
+        return probe.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
 
-def run_worker(script: str, workspace: Path, payload: dict[str, Any], *, timeout: float = 600) -> tuple[dict[str, Any], str]:
-    """Run ``workers/<script>`` on a workspace. Returns (result, log)."""
-    command = [sys.executable, "-I", "-B", str(WORKERS / script), str(workspace)]
-    if network_isolation():
-        command = ["unshare", "--net", "--map-root-user", *command]
-    with tempfile.TemporaryDirectory(prefix="brick-home-") as home:
-        env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONHASHSEED": "0", "HOME": home,
-               "LANG": "C.UTF-8", "TMPDIR": home}
+def network_isolation() -> bool:
+    return isolation()
+
+
+class Sandbox:
+    """What every worker hides and protects."""
+
+    def __init__(self, hide: list[Path]) -> None:
+        self.hide = [Path(p).resolve() for p in hide]
+        self.unsandboxed = not isolation()
+        if self.unsandboxed and os.environ.get("BRICK_RUNNER_UNSANDBOXED") != "1":
+            raise SandboxError("this host cannot create user, network and mount namespaces; "
+                               "the runner refuses to evaluate without them")
+
+    def command(self, script: str, workspace: Path) -> tuple[list[str], str]:
+        python = [sys.executable, "-I", "-B", str(WORKERS / script)]
+        if self.unsandboxed:
+            return [*python, str(workspace)], str(workspace)
+        keep = {Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve(), WORKERS}
+        hide = {Path(tempfile.gettempdir()).resolve(), *self.hide}
+        args = [*(f"ro:{p}" for p in sorted(keep)),
+                *(f"hide:{p}" for p in sorted(hide) if not any(_inside(k, p) for k in keep))]
+        return (["unshare", "--net", "--mount", "--map-root-user", "--propagation", "private",
+                 "sh", "-c", WRAPPER, "sandbox", str(workspace), *args, "--", *python, MOUNT_POINT],
+                MOUNT_POINT)
+
+    @staticmethod
+    def env() -> dict[str, str]:
+        return {"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONHASHSEED": "0", "LANG": "C.UTF-8",
+                "HOME": "/mnt", "TMPDIR": "/mnt"}
+
+    def run(self, script: str, workspace: Path, payload: dict[str, Any], *, timeout: float = 600) -> tuple[dict[str, Any], str]:
+        """A one-shot worker: payload on stdin, one result after the marker on stdout."""
+        command, _ = self.command(script, workspace)
         try:
             done = subprocess.run(command, input=json.dumps(payload), capture_output=True, text=True,
-                                  timeout=timeout, cwd=workspace, env=env)
+                                  timeout=timeout, cwd=workspace, env=self.env())
         except subprocess.TimeoutExpired as exc:
             raise SandboxError(f"{script} exceeded {timeout:.0f}s", _text(exc.stderr)) from exc
-    log = done.stderr[-8000:]
-    if MARKER not in done.stdout:
-        raise SandboxError(f"{script} exited {done.returncode} without a result", log)
-    result = json.loads(done.stdout.rsplit(MARKER, 1)[1])
-    if "fatal" in result:
-        raise SandboxError(f"{script} failed: {result['fatal']}", log)
-    return result, log
+        log = done.stderr[-8000:]
+        if MARKER not in done.stdout:
+            raise SandboxError(f"{script} exited {done.returncode} without a result", log)
+        result = json.loads(done.stdout.rsplit(MARKER, 1)[1])
+        if "fatal" in result:
+            raise SandboxError(f"{script} failed: {result['fatal']}", log)
+        return result, log
+
+    def start(self, script: str, workspace: Path) -> "Process":
+        command, _ = self.command(script, workspace)
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, cwd=workspace, env=self.env(), bufsize=1)
+        return Process(process)
+
+
+class Process:
+    """A long-lived worker that speaks one JSON object per line."""
+
+    def __init__(self, process: subprocess.Popen) -> None:
+        self.process = process
+        self.log: list[str] = []
+        self.messages: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        threading.Thread(target=self._drain, daemon=True).start()
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _drain(self) -> None:
+        assert self.process.stderr is not None
+        for line in self.process.stderr:
+            self.log.append(line)
+            if len(self.log) > 400:
+                del self.log[:200]
+
+    def _read(self) -> None:
+        assert self.process.stdout is not None
+        for line in self.process.stdout:
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue  # stray output; only well-formed protocol lines count
+            if isinstance(message, dict) and "op" in message:
+                self.messages.put(message)
+        self.messages.put(None)
+
+    def send(self, message: dict[str, Any]) -> None:
+        assert self.process.stdin is not None
+        try:
+            self.process.stdin.write(json.dumps(message) + "\n")
+            self.process.stdin.flush()
+        except BrokenPipeError as exc:
+            raise SandboxError("the worker stopped", self.log_text()) from exc
+
+    def receive(self, deadline: float) -> dict[str, Any]:
+        remaining = deadline - time.monotonic()
+        try:
+            message = self.messages.get(timeout=max(remaining, 0.001))
+        except queue.Empty:
+            self.stop()
+            raise SandboxError("the worker exceeded its time limit", self.log_text()) from None
+        if message is None:
+            self.messages.put(None)
+            time.sleep(0.05)
+            raise SandboxError("the worker stopped", self.log_text())
+        return message
+
+    def stop(self) -> None:
+        if self.process.poll() is None:
+            self.process.kill()
+        self.process.wait()
+        for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
+
+    def log_text(self) -> str:
+        return "".join(self.log)[-8000:]
+
+
+def _inside(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 def _text(value: Any) -> str:

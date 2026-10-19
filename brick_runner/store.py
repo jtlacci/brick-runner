@@ -78,7 +78,9 @@ class Store:
         index = self._load_index()
         for record in records:
             stored = {k: v for k, v in record.items() if k not in PAYLOAD_FIELDS}
-            stored.setdefault("source", source)
+            stored["source"] = source  # the caller decides, never the record
+            if "time" in stored:
+                stored["time"] = normalise_time(stored["time"])
             for field in PAYLOAD_FIELDS:
                 if field in record:
                     stored[f"{field}_ref"] = self.put(record[field])
@@ -122,8 +124,10 @@ class Store:
         rows = [r for r in self._load_index().values() if all(r.get(k) == v for k, v in match.items())]
         yield from sorted(rows, key=lambda r: (r.get("time", ""), r["id"]))
 
-    def exchanges(self, trace_id: str) -> list[dict[str, Any]]:
-        return [self.expand(r) for r in self.query(kind="exchange", trace_id=trace_id)]
+    def exchanges(self, trace_id: str, within: set[str] | None = None) -> list[dict[str, Any]]:
+        """A trace's exchanges; with ``within``, only those pinned in that ID set."""
+        return [self.expand(r) for r in self.query(kind="exchange", trace_id=trace_id)
+                if within is None or r["id"] in within]
 
     def between(self, start: str, end: str) -> list[dict[str, Any]]:
         """Records with start < time <= end, with payloads."""
@@ -132,11 +136,17 @@ class Store:
     # ------------------------------------------------------------ datasets
 
     def create_dataset(self, record_ids: Iterable[str]) -> str:
-        ids = sorted(set(record_ids))
+        """Pin runs, and every exchange recorded in their traces, as one dataset."""
+        ids = set(record_ids)
         index = self._load_index()
         missing = [i for i in ids if i not in index]
         if missing:
             raise StoreError(f"{len(missing)} record IDs are not in the store")
+        traces = {index[i].get("trace_id") for i in ids if index[i].get("kind") == "run"}
+        sources = {index[i].get("source") for i in ids}
+        ids |= {r["id"] for r in index.values()
+                if r.get("kind") == "exchange" and r.get("trace_id") in traces and r.get("source") in sources}
+        ids = sorted(ids)
         key = digest(ids)
         path = self.root / "datasets" / f"{key[7:]}.json"
         if not path.exists():
@@ -174,6 +184,17 @@ class Store:
         remotes = subprocess.run(["dvc", "remote", "list"], cwd=self.root, capture_output=True, text=True)
         if push and remotes.stdout.strip():
             _run(["dvc", "push", "-q"], self.root)
+
+
+def normalise_time(value: Any) -> str:
+    """One time format, so times compare as strings: UTC ISO 8601 with microseconds."""
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError as exc:
+        raise StoreError(f"not an ISO 8601 time: {value!r}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
 def _run(command: list[str], cwd: Path) -> None:

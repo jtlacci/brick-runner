@@ -78,7 +78,7 @@ def dispatch(args: argparse.Namespace) -> dict:
         return {"synced": True}
     if args.command == "dataset":
         store = Store(home / "store")
-        sources = {"live", "regenerated"} | ({"synthetic"} if args.include_synthetic else set())
+        sources = {"live"} | ({"synthetic"} if args.include_synthetic else set())
         ids = [r["id"] for r in store.query(kind="run", brick=args.brick) if r.get("source") in sources]
         if not ids:
             raise StoreError(f"no stored runs for {args.brick}")
@@ -94,7 +94,8 @@ def dispatch(args: argparse.Namespace) -> dict:
         return runner.promote(args.brick)
     if args.command == "trials":
         entries = runner.ledger.find(args.brick)
-        return {"trials": [{"run": e.run_id, "metrics": e.metrics,
+        return {"trials": [{"run": e.run_id,
+                            "metrics": {} if e.tag("split") == "holdout" else e.metrics,
                             **{k: v for k, v in e.tags.items() if not k.startswith("mlflow.")}}
                            for e in entries]}
     raise RunnerError(f"unknown command {args.command}")

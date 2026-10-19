@@ -16,8 +16,10 @@ import os
 from pathlib import Path
 from typing import Any
 
-import mlflow
-from mlflow.tracking import MlflowClient
+os.environ.setdefault("MLFLOW_DISABLE_AGENT_HINT", "1")
+os.environ.setdefault("MLFLOW_ENABLE_ARTIFACTS_PROGRESS_BAR", "false")
+
+from mlflow.tracking import MlflowClient  # noqa: E402
 
 ENVELOPE = "envelope.json"
 
@@ -39,8 +41,6 @@ class Ledger:
         home.mkdir(parents=True, exist_ok=True)
         self.uri = f"sqlite:///{home / 'mlflow.db'}"
         self.artifacts = (home / "mlartifacts").resolve()
-        os.environ.setdefault("MLFLOW_ENABLE_ARTIFACTS_PROGRESS_BAR", "false")
-        os.environ.setdefault("MLFLOW_DISABLE_AGENT_HINT", "1")
         self.client = MlflowClient(tracking_uri=self.uri)
 
     def _experiment(self, brick: str) -> str:
@@ -63,9 +63,16 @@ class Ledger:
     def find(self, brick: str, **tags: str) -> list[Entry]:
         """Entries whose tags equal every given value, newest first."""
         clauses = " and ".join(f"tags.{k} = '{_quote(v)}'" for k, v in tags.items())
-        runs = self.client.search_runs([self._experiment(brick)], filter_string=clauses,
-                                       order_by=["attributes.start_time DESC"], max_results=5000)
-        return [Entry(r.info.run_id, dict(r.data.tags), dict(r.data.metrics), r.info.start_time) for r in runs]
+        entries: list[Entry] = []
+        token = None
+        while True:
+            page = self.client.search_runs([self._experiment(brick)], filter_string=clauses,
+                                           order_by=["attributes.start_time DESC"], max_results=1000,
+                                           page_token=token)
+            entries += [Entry(r.info.run_id, dict(r.data.tags), dict(r.data.metrics), r.info.start_time) for r in page]
+            token = page.token
+            if not token:
+                return entries
 
     def envelope(self, run_id: str) -> dict[str, Any]:
         path = self.client.download_artifacts(run_id, ENVELOPE)

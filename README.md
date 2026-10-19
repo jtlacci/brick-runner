@@ -9,21 +9,37 @@ The runner is the only component that reads evaluation data, runs evaluations, r
 | Step | What happens |
 | --- | --- |
 | Pin | Every input comes from Git: the base commit gives the framework, every other brick and all human-only files. The candidate gives only the files of its own loop, classified by the policy on the base. |
-| Data | Each case is a recorded brick run. Its exchanges (external calls and sibling calls) are replayed. A new brick with `data.lock = unpinned` uses `generate(seed)`. |
+| Trees | Each evaluation gets three separate trees: **code** (the candidate), **deps** (other bricks, for sibling calls) and **evaluation** (the scorer). No worker can see another's tree. |
+| Data | Each case is a recorded brick run. The dataset pins the run and every exchange in its trace. A new brick with `data.lock = unpinned` uses `generate(seed)`. |
 | Build | `build()` runs in the evaluator worker, which never imports the brick. |
-| Run | The brick runs in the candidate worker: no network (`unshare --net` when the host allows it, plus an audit hook), a clean environment, a time limit. |
-| Score | `score()` runs in the evaluator worker again, separate from the candidate. |
+| Run | The brick runs in the candidate worker. Every io call it makes goes to the parent, which answers from the pinned exchanges. |
+| Score | `score()` runs in the evaluator worker again, after the runner checks that the evaluation files are unchanged. |
 | Record | Every trial goes to the MLflow ledger with its evaluation ID, epoch and result. |
+
+### The sandbox
+
+Every worker runs in new user, network and mount namespaces (`unshare`):
+
+- no network;
+- its own tree, mounted at `/mnt`;
+- `/tmp`, the runner's state folder and the brick repository are hidden behind empty mounts, so a worker cannot read the signing key, the store, the ledger or another worker's tree;
+- the Python environment and the worker scripts are read-only.
+
+An audit hook also refuses sockets and subprocesses. On a host without namespaces the runner refuses to evaluate, unless `BRICK_RUNNER_UNSANDBOXED=1` is set for development; results then say `"sandboxed": false`.
 
 ### Replay rules
 
+The parent process decides every replayed call. The candidate reports only its outputs.
+
 | Call | Recorded? | Result |
 | --- | --- | --- |
-| External | Yes | The recorded response |
-| External | No | The case is out of evidence: not a pass, not a fail |
-| Deterministic sibling | Hash | The sibling runs again; a different hash is a determinism mismatch, which fails the trial |
+| External | Yes | The recorded response. Each recording answers one call. |
+| External | No | The case is out of evidence: excluded, and counted |
+| Deterministic sibling | Hash | The sibling runs again in a dependency worker; a different hash is a determinism mismatch, which fails the trial |
 | Nondeterministic sibling | Response | The recorded response |
-| Nondeterministic sibling | No (request or contract changed) | The sibling runs again, and the new response is stored as `regenerated` |
+| Nondeterministic sibling | No (request or contract changed) | The sibling runs again in a dependency worker. The result is counted as regenerated, and never stored. |
+
+A case counts as out of evidence only when the parent refused a call. A brick that raises `OutOfEvidence` itself gets a run error. A trial fails when more than `max_out_of_evidence` of its cases (default 5%) are out of evidence, so a candidate cannot skip hard cases.
 
 ### What each split shows
 
@@ -52,7 +68,9 @@ Each command prints one JSON object. The exit code is 0 for a pass, 1 for a fail
 
 ## The two loops
 
-**Code loop.** `submit` evaluates the candidate's code against the pinned evaluation. `holdout` takes the best passing validation trial of the epoch (by the policy's metric, higher is better) and runs its one holdout. A candidate never gets a second holdout run. For a `time` split, the holdout is data captured after the candidate's freeze time, so `holdout` answers `waiting` until enough new data exists. `promote` needs a signed passing holdout. It also runs the defect check if the epoch has none, and evaluates every dependent brick with the candidate. If any check fails, production does not change.
+**Code loop.** `submit` evaluates the candidate's code against the pinned evaluation. `holdout` takes the best passing validation trial of the epoch (by the policy's metric, higher is better) and runs its one holdout. The holdout is keyed by every component hash and the exact holdout evidence, so the same candidate never gets a second run on the same evidence, in any epoch. It gets a new run only when the base or the evidence really changed. For a `time` split, the holdout is data captured after the candidate's freeze time, so `holdout` answers `waiting` until enough new data exists.
+
+`promote` needs a signed passing holdout whose component hashes still match the current base; otherwise it asks for a new holdout. It runs the defect check if the epoch has none, and evaluates every direct dependent with the candidate. If any check fails, production does not change. A bundle whose holdout used synthetic data says `"synthetic": true`: the dev agent can read `generate()`, so that holdout is not hidden. Use shadow or paper mode to collect real data before you rely on it.
 
 **Evaluation loop.** `evaluation-change` runs the defect check: seeded mutations of the production code (`src/` and `input/adapters/`) at strengths 1, 2 and 4. The candidate evaluation passes only when scores fall as defects grow, and the strongest defects are detected. It also scores production under the old and the new evaluation. A human approves the change; when it merges, a new epoch starts.
 
@@ -74,7 +92,9 @@ Neither MLflow nor the store is append-only. The runner must be the only writer,
 ## Limits
 
 - The runner runs evaluations one at a time (a file lock). There is no queue service.
-- The sandbox blocks the network and subprocesses. It does not stop a candidate from writing files on the runner machine, so run the runner on its own machine.
+- The sandbox hides `/tmp`, the runner state and the repository, and makes Python read-only. A candidate can still write to other folders of the runner user, so run the runner as its own user on its own machine.
+- The defect check mutates `src/` and `input/adapters/`, not `runner/` or `input/config.yml`. A brick with nothing to mutate cannot be promoted.
+- Promotion checks direct dependents only. A dependent that was never promoted is checked with its base code.
 - The brick repository's third-party dependencies must be installed in the runner's Python environment. The environment lock file is pinned in the evaluation ID, but the runner does not install it.
 - Selection is `best` only. Score correction for many trials is later work; the ledger keeps every trial, so it can be applied to old epochs.
 

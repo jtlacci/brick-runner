@@ -5,11 +5,11 @@ from __future__ import annotations
 import contextlib
 from datetime import datetime, timedelta, timezone
 import fcntl
-import hmac
+import functools
 import hashlib
+import hmac
 import json
 import math
-import os
 from pathlib import Path
 import secrets
 import shutil
@@ -17,11 +17,12 @@ import statistics
 import tempfile
 from typing import Any, Iterator
 
-from . import mutate, sandbox, splits, workspace
+from . import broker, mutate, splits, workspace
 from .gitrepo import Repo
 from .hashing import canonical, digest
 from .ledger import Entry, Ledger, _metric_name
-from .policy import CODE, EVALUATION, Policy, dependents, load_lock, load_policy
+from .policy import CODE, EVALUATION, Policy, contract_literal, dependents, load_lock, load_policy
+from .sandbox import Sandbox, SandboxError
 from .store import Store
 from .workspace import Overlay, Workspace
 
@@ -29,6 +30,7 @@ SYNTHETIC_TIME = "1970-01-01T00:00:00+00:00"
 DEFECT_STRENGTHS = (1, 2, 4)
 DEFECT_SEEDS = (0, 1, 2, 3)
 OPERATORS = {">=": lambda a, b: a >= b, "<=": lambda a, b: a <= b, ">": lambda a, b: a > b, "<": lambda a, b: a < b}
+LOG_LIMIT = 4000
 
 
 class RunnerError(RuntimeError):
@@ -48,6 +50,8 @@ class Runner:
         self.ledger = Ledger(self.home)
         self.base_ref = base_ref
         self.key = self._key()
+        # Workers never see the runner's state or the repository.
+        self.sandbox = Sandbox(hide=[self.home, self.repo.path])
 
     # ------------------------------------------------------------ basics
 
@@ -78,6 +82,10 @@ class Runner:
             raise RunnerError(f"bricks/{brick} has no evaluation/ at {base[:12]}")
         return tree
 
+    @functools.lru_cache(maxsize=None)
+    def _deterministic(self, base: str, brick: str) -> bool:
+        return contract_literal(self.repo, base, brick, "DETERMINISTIC", False) is True
+
     def production(self, brick: str) -> Entry | None:
         found = self.ledger.find(brick, kind="promotion")
         return found[0] if found else None
@@ -86,20 +94,24 @@ class Runner:
         entry = self.production(brick)
         return entry.tag("commit") if entry else base
 
+    def _evaluator(self, ws: Workspace, payload: dict[str, Any]) -> dict[str, Any]:
+        workspace.verify_evaluation(self.repo, ws)
+        result, _ = self.sandbox.run("evaluator.py", ws.evaluation, {"brick": ws.target, **payload})
+        return result
+
     # ------------------------------------------------------------ data
 
-    def dataset(self, brick: str, base: str, ws: Workspace, policy: Policy) -> tuple[str, list[dict[str, Any]]]:
+    def dataset(self, brick: str, base: str, ws: Workspace, policy: Policy) -> tuple[str, set[str], list[dict[str, Any]]]:
+        """(dataset key, every pinned record ID, the brick's pinned runs)."""
         lock = load_lock(self.repo, base, brick)
-        if lock == "unpinned":
-            return self.synthetic(brick, ws, policy)
-        ids = self.store.dataset(lock)
-        records = [self.store.record(i) for i in ids]
-        return lock, [r for r in records if r.get("kind") == "run" and r.get("brick") == brick]
+        key = self.synthetic(brick, ws, policy) if lock == "unpinned" else lock
+        pinned = set(self.store.dataset(key))
+        runs = [self.store.record(i) for i in sorted(pinned)]
+        return key, pinned, [r for r in runs if r.get("kind") == "run" and r.get("brick") == brick]
 
-    def synthetic(self, brick: str, ws: Workspace, policy: Policy) -> tuple[str, list[dict[str, Any]]]:
-        """Records from evaluate.generate(seed), for a brick with no real data yet."""
-        result, _ = sandbox.run_worker("evaluator.py", ws.path,
-                                       {"command": "generate", "brick": brick, "seeds": policy.seeds})
+    def synthetic(self, brick: str, ws: Workspace, policy: Policy) -> str:
+        """A dataset from evaluate.generate(seed), for a brick with no real data yet."""
+        result = self._evaluator(ws, {"command": "generate", "seeds": policy.seeds})
         records: list[dict[str, Any]] = []
         for seed, items in sorted(result["generated"].items(), key=lambda kv: int(kv[0])):
             for index, item in enumerate(items):
@@ -119,14 +131,15 @@ class Runner:
         run_ids = [record_id for record_id, record in zip(ids, records) if record["kind"] == "run"]
         if not run_ids:
             raise RunnerError(f"{brick}: data.lock is unpinned and generate() returned no records")
-        return self.store.create_dataset(run_ids), [self.store.record(i) for i in run_ids]
+        return self.store.create_dataset(run_ids)
 
     def _later(self, record: dict[str, Any], horizon: float) -> list[dict[str, Any]]:
-        if horizon <= 0 or record.get("source") == "synthetic":
+        """Live records within the label horizon after a case. Never synthetic, never candidate-made."""
+        if horizon <= 0 or record.get("source") != "live":
             return []
         start = record["time"]
         end = (datetime.fromisoformat(start) + timedelta(seconds=horizon)).isoformat(timespec="microseconds")
-        return self.store.between(start, end)
+        return [r for r in self.store.between(start, end) if r.get("source") == "live"]
 
     # ------------------------------------------------------------ one evaluation
 
@@ -138,31 +151,41 @@ class Runner:
         own = ws is None
         ws = ws or workspace.build(self.repo, base, overlays, brick)
         try:
-            dataset_key, records = self.dataset(brick, base, ws, policy)
-            parts = splits.assign(records, policy.split, freeze)
-            chosen = parts[split]
+            dataset_key, pinned, runs = self.dataset(brick, base, ws, policy)
+            chosen = splits.assign(runs, policy.split, freeze)[split]
             if split == splits.HOLDOUT and policy.split["kind"] == "time":
+                seen = {c["id"] for c in chosen}
                 chosen += [self.store.expand(r) for r in self.store.query(kind="run", brick=brick, source="live")
-                           if freeze and r["time"] > freeze and r["id"] not in {c["id"] for c in chosen}]
+                           if freeze and r["time"] > freeze and r["id"] not in seen]
+            for record in chosen:
+                within = pinned if record["id"] in pinned else None
+                record["exchanges"] = [e for e in self.store.exchanges(record["trace_id"], within)
+                                       if e.get("source") in ("live", "synthetic")]
             if split == splits.HOLDOUT and len(chosen) < policy.split["min_holdout"]:
                 return {"status": "waiting", "have": len(chosen), "need": policy.split["min_holdout"]}
-            for record in chosen:
-                record["exchanges"] = self.store.exchanges(record["trace_id"])
+            evidence = digest(sorted([r["id"] for r in chosen] + [e["id"] for r in chosen for e in r["exchanges"]]))
             identity = {"brick": brick, "split": split, "hashes": ws.hashes, "dataset": dataset_key,
-                        "records": digest(sorted(r["id"] for r in chosen)), "seeds": policy.seeds,
+                        "evidence": evidence, "seeds": policy.seeds,
                         "policy": self.repo.tree(base, f"bricks/{brick}/evaluation/policy.yml")}
             eval_id = digest(identity)
+            holdout_key = digest({"hashes": ws.hashes, "evidence": evidence})
+            if split == splits.HOLDOUT:
+                used = self.ledger.find(brick, kind="trial", split=splits.HOLDOUT, holdout_key=holdout_key)
+                if used:
+                    return {"status": "used", "passed": used[0].tag("passed") == "True", "trial": used[0].run_id}
             if cache:
                 hits = self.ledger.find(brick, eval_id=eval_id, kind=kind)
                 if hits:
                     envelope = self.ledger.envelope(hits[0].run_id)
                     envelope["cached"] = True
                     return envelope
-            envelope = self._execute(brick, ws, policy, chosen)
+            envelope = self._execute(brick, ws, policy, chosen, base)
             envelope.update({"eval_id": eval_id, "identity": identity, "split": split, "brick": brick,
-                             "time": now(), "network_isolated": sandbox.network_isolation()})
+                             "time": now(), "sandboxed": not self.sandbox.unsandboxed,
+                             "synthetic": load_lock(self.repo, base, brick) == "unpinned"})
             entry_tags = {"eval_id": eval_id, "split": split, "epoch": self.epoch(brick, base), "base": base,
-                          "passed": envelope["passed"], "metric": policy.metric, **(tags or {})}
+                          "passed": envelope["passed"], "metric": policy.metric, "holdout_key": holdout_key,
+                          "code": ws.hashes["code"], **(tags or {})}
             for overlay in ws.overlays:
                 entry_tags[f"{overlay.kind}:{overlay.brick}"] = overlay.commit
             envelope["trial"] = self.ledger.write(brick, kind, entry_tags, envelope["terms"], envelope)
@@ -171,15 +194,20 @@ class Runner:
             if own:
                 ws.cleanup()
 
-    def _execute(self, brick: str, ws: Workspace, policy: Policy, records: list[dict[str, Any]]) -> dict[str, Any]:
+    def _execute(self, brick: str, ws: Workspace, policy: Policy, records: list[dict[str, Any]], base: str) -> dict[str, Any]:
         counts = {"cases": len(records), "build_errors": 0, "out_of_evidence": 0, "run_errors": 0,
                   "score_errors": 0, "determinism_mismatches": 0, "regenerated": 0, "scored": 0}
         examples: list[dict[str, Any]] = []
-        gates_result, _ = sandbox.run_worker("evaluator.py", ws.path, {"command": "gates", "brick": brick})
-        gates = gates_result["gates"]
-        built, _ = sandbox.run_worker("evaluator.py", ws.path, {"command": "build", "brick": brick, "records": records})
+        reasons: list[str] = []
+        gates = self._evaluator(ws, {"command": "gates"})["gates"]
+        if not all(isinstance(g, list) and len(g) == 3 and isinstance(g[0], str) and g[1] in OPERATORS
+                   and isinstance(g[2], (int, float)) and not isinstance(g[2], bool) for g in gates):
+            raise RunnerError("GATES must be a tuple of (term, operator, threshold)")
+        if not gates:
+            reasons.append("evaluate.py declares no GATES")
+        built = self._evaluator(ws, {"command": "build", "records": records})["inputs"]
         cases, kept = [], []
-        for record, item in zip(records, built["inputs"]):
+        for record, item in zip(records, built):
             if "error" in item:
                 counts["build_errors"] += 1
                 examples.append({"record": record["id"], "stage": "build", "error": item["error"]})
@@ -187,31 +215,29 @@ class Runner:
             cases.append({"input": item["input"], "exchanges": record["exchanges"]})
             kept.append(record)
         try:
-            ran, log = sandbox.run_worker("candidate.py", ws.path, {"brick": brick, "cases": cases})
-        except sandbox.SandboxError as exc:
+            results, log = broker.run_cases(self.sandbox, brick, ws.code, ws.deps,
+                                            functools.partial(self._deterministic, base), cases)
+        except SandboxError as exc:
             return {"passed": False, "terms": {}, "gates": [], "counts": counts, "fatal": str(exc),
-                    "counterexamples": examples, "log": exc.log}
-        items, outcomes, regenerated = [], [], []
-        for record, result in zip(kept, ran["results"]):
-            counts["determinism_mismatches"] += len(result["mismatches"])
-            for new in result["regenerated"]:
-                regenerated.append({"kind": "exchange", **new, "request_hash": digest(new["request"]),
-                                    "response_hash": digest(new["response"]), "trace_id": record["trace_id"],
-                                    "run_id": record.get("run_id"), "time": record["time"]})
-            if "out_of_evidence" in result:
+                    "reasons": [f"the candidate worker failed: {exc}"], "counterexamples": examples,
+                    "log": exc.log[-LOG_LIMIT:]}
+        items, outcomes = [], []
+        for record, result in zip(kept, results):
+            counts["determinism_mismatches"] += result["mismatches"]
+            counts["regenerated"] += result["regenerated"]
+            if result.get("out_of_evidence"):
                 counts["out_of_evidence"] += 1
                 continue
             if "error" in result:
                 counts["run_errors"] += 1
-                examples.append({"record": record["id"], "stage": "run", "input": record.get("input"), "error": result["error"]})
-            items.append({"record": record, "output": result.get("output"), "later": self._later(record, policy.horizon)})
+                examples.append({"record": record["id"], "stage": "run", "input": record.get("input"),
+                                 "error": result["error"]})
+            items.append({"record": record, "output": result.get("output"),
+                          "later": self._later(record, policy.horizon)})
             outcomes.append((record, result))
-        if regenerated:
-            self.store.add_records(regenerated, source="regenerated")
-            counts["regenerated"] = len(regenerated)
-        scored, _ = sandbox.run_worker("evaluator.py", ws.path, {"command": "score", "brick": brick, "items": items})
+        scores = self._evaluator(ws, {"command": "score", "items": items})["scores"]
         per_case: list[tuple[dict[str, Any], dict[str, Any], dict[str, float]]] = []
-        for (record, result), score in zip(outcomes, scored["scores"]):
+        for (record, result), score in zip(outcomes, scores):
             if "error" in score:
                 counts["score_errors"] += 1
                 examples.append({"record": record["id"], "stage": "score", "error": score["error"]})
@@ -225,28 +251,38 @@ class Runner:
             value = means.get(term)
             ok = value is not None and OPERATORS[operator](value, threshold)
             gate_results.append({"term": term, "operator": operator, "threshold": threshold, "value": value, "passed": ok})
-            if not ok and value is not None:
+            if not ok:
+                reasons.append(f"gate {term} {operator} {threshold} failed")
                 worst = sorted(per_case, key=lambda c: c[2].get(term, math.inf if operator in (">=", ">") else -math.inf),
                                reverse=operator in ("<=", "<"))[:5]
                 for record, result, terms in worst:
                     examples.append({"record": record["id"], "stage": "gate", "term": term, "value": terms.get(term),
                                      "input": record.get("input"), "output": result.get("output")})
-        passed = (counts["scored"] > 0 and all(g["passed"] for g in gate_results)
-                  and counts["determinism_mismatches"] == 0 and counts["score_errors"] == 0 and policy.metric in means)
-        return {"passed": passed, "terms": means, "gates": gate_results, "counts": counts,
-                "counterexamples": examples[:50], "log": log}
+        share = counts["out_of_evidence"] / max(1, len(cases))
+        if share > policy.max_out_of_evidence:
+            reasons.append(f"{share:.0%} of cases are out of evidence; the policy allows {policy.max_out_of_evidence:.0%}")
+        if counts["scored"] == 0:
+            reasons.append("no case was scored")
+        if counts["determinism_mismatches"]:
+            reasons.append("a deterministic dependency gave a different result than recorded")
+        if counts["score_errors"]:
+            reasons.append("score() failed on some cases")
+        if policy.metric not in means:
+            reasons.append(f"no {policy.metric!r} term to rank by")
+        return {"passed": not reasons, "terms": means, "gates": gate_results, "counts": counts,
+                "reasons": reasons, "counterexamples": examples[:50], "log": log[-LOG_LIMIT:]}
 
     # ------------------------------------------------------------ what each split may see
 
     @staticmethod
     def view(envelope: dict[str, Any], split: str) -> dict[str, Any]:
-        if envelope.get("status") == "waiting":
-            return envelope
+        if envelope.get("status") in ("waiting", "used"):
+            return {k: v for k, v in envelope.items() if k in ("status", "have", "need", "passed")}
         if split == splits.DEVELOPMENT:
             return {k: v for k, v in envelope.items() if k != "identity"}
         if split == splits.VALIDATION:
-            return {k: envelope.get(k) for k in ("passed", "terms", "gates", "counts", "trial", "eval_id", "cached", "fatal")
-                    if k in envelope}
+            return {k: envelope.get(k) for k in ("passed", "terms", "gates", "counts", "reasons", "trial",
+                                                 "eval_id", "cached", "fatal") if k in envelope}
         return {"passed": envelope.get("passed")}
 
     # ------------------------------------------------------------ code loop
@@ -256,39 +292,39 @@ class Runner:
         if split not in (splits.DEVELOPMENT, splits.VALIDATION):
             raise RunnerError("submissions run on development or validation; the holdout runs only through holdout()")
         commit = self.repo.commit(commit)
+        freeze = now()
         with self.exclusive():
-            envelope = self.evaluate(brick, split, [Overlay(brick, CODE, commit)],
-                                     tags={"loop": "code", "candidate": commit, "freeze": now()})
+            envelope = self.evaluate(brick, split, [Overlay(brick, CODE, commit)], freeze=freeze,
+                                     tags={"loop": "code", "candidate": commit, "freeze": freeze})
         return self.view(envelope, split)
 
     def holdout(self, brick: str) -> dict[str, Any]:
         """Select the best validation trial of this epoch and run its one holdout."""
-        base = self.base()
-        epoch = self.epoch(brick, base)
-        policy = load_policy(self.repo, base, brick)
-        metric = _metric_name(policy.metric)
-        trials = [t for t in self.ledger.find(brick, kind="trial", split="validation", epoch=epoch, loop="code")
-                  if t.tag("passed") == "True" and metric in t.metrics]
-        if not trials:
-            raise RunnerError("no passing validation trial in this epoch")
-        best = max(trials, key=lambda t: (t.metrics[metric], -t.start_time))
-        candidate = best.tag("candidate")
-        used = self.ledger.find(brick, kind="trial", split="holdout", epoch=epoch, candidate=candidate)
-        if used:
-            return {"passed": used[0].tag("passed") == "True", "candidate": candidate,
-                    "note": "this candidate already used its holdout run"}
         with self.exclusive():
+            base = self.base()
+            epoch = self.epoch(brick, base)
+            policy = load_policy(self.repo, base, brick)
+            metric = _metric_name(policy.metric)
+            trials = [t for t in self.ledger.find(brick, kind="trial", split="validation", epoch=epoch, loop="code")
+                      if t.tag("passed") == "True" and metric in t.metrics]
+            if not trials:
+                raise RunnerError("no passing validation trial in this epoch")
+            best = max(trials, key=lambda t: (t.metrics[metric], -t.start_time))
+            candidate = best.tag("candidate")
             envelope = self.evaluate(brick, splits.HOLDOUT, [Overlay(brick, CODE, candidate)], base=base,
                                      freeze=best.tag("freeze"), cache=False,
                                      tags={"loop": "code", "candidate": candidate, "freeze": best.tag("freeze"),
                                            "selected_from": best.run_id})
-        if envelope.get("status") == "waiting":
-            return {**envelope, "candidate": candidate}
-        claim = {"trial": envelope["trial"], "eval_id": envelope["eval_id"], "passed": envelope["passed"],
-                 "candidate": candidate, "epoch": epoch}
-        signature = self.sign(claim)
-        self.ledger.set_tag(envelope["trial"], "signature", signature)
-        holdout_runs = len(self.ledger.find(brick, kind="trial", split="holdout", epoch=epoch))
+            if envelope.get("status") == "used":
+                return {"passed": envelope["passed"], "candidate": candidate,
+                        "note": "this candidate already used its holdout run on this evidence"}
+            if envelope.get("status") == "waiting":
+                return {**envelope, "candidate": candidate}
+            claim = {"trial": envelope["trial"], "eval_id": envelope["eval_id"], "passed": envelope["passed"],
+                     "candidate": candidate, "epoch": epoch}
+            signature = self.sign(claim)
+            self.ledger.set_tag(envelope["trial"], "signature", signature)
+            holdout_runs = len(self.ledger.find(brick, kind="trial", split="holdout", epoch=epoch))
         return {"passed": envelope["passed"], "candidate": candidate, "signature": signature,
                 "holdout_runs_this_epoch": holdout_runs}
 
@@ -308,6 +344,12 @@ class Runner:
         policy = load_policy(self.repo, base, brick)
         holdout, envelope = self._verified_holdout(brick, epoch)
         candidate = holdout.tag("candidate")
+        with workspace.build(self.repo, base, [Overlay(brick, CODE, candidate)], brick) as ws:
+            current = ws.hashes
+        if current != envelope["identity"]["hashes"]:
+            changed = sorted(k for k in set(current) | set(envelope["identity"]["hashes"])
+                             if current.get(k) != envelope["identity"]["hashes"].get(k))
+            raise RunnerError(f"the base changed since the holdout ({', '.join(changed)}); run holdout again")
         if not self.ledger.find(brick, kind="defect-check", eval_tree=epoch, passed="True"):
             report = self.defect_check(brick, impl_commit=candidate, eval_commit=base)
             if not report["passed"]:
@@ -327,6 +369,7 @@ class Runner:
             raise RunnerError(f"promotion stopped: dependents fail with this candidate: {', '.join(failed)}")
         bundle = {"brick": brick, "commit": candidate, "base": base, "epoch": epoch,
                   "hashes": envelope["identity"]["hashes"], "dataset": envelope["identity"]["dataset"],
+                  "synthetic": envelope.get("synthetic", False),
                   "split": policy.split, "seeds": policy.seeds, "gates": envelope["gates"],
                   "holdout_trial": holdout.run_id, "holdout_signature": holdout.tag("signature"),
                   "dependents": checks, "time": now()}
@@ -352,7 +395,7 @@ class Runner:
             report: dict[str, Any] = {"brick": brick, "impl_commit": impl_commit, "eval_commit": eval_commit,
                                       "eval_tree": eval_tree, "metric": policy.metric, "baseline": base_value,
                                       "strengths": {}}
-            brick_dir = ws.path / "bricks" / brick
+            brick_dir = ws.code / "bricks" / brick
             if base_value is None:
                 report.update(passed=False, reason=f"the baseline has no {policy.metric!r} term")
             elif not mutate.points(brick_dir):
@@ -363,11 +406,12 @@ class Runner:
                 for strength in DEFECT_STRENGTHS:
                     raw[strength] = []
                     for seed in DEFECT_SEEDS:
-                        mutant = Workspace(Path(tempfile.mkdtemp(prefix="brick-mutant-")), base, overlays)
+                        code = Path(tempfile.mkdtemp(prefix="brick-mutant-"))
+                        mutant = ws.with_code(code)
                         try:
-                            shutil.copytree(ws.path, mutant.path, dirs_exist_ok=True)
-                            mutate.mutate(mutant.path / "bricks" / brick, strength, seed * 1000 + strength)
-                            mutant.hashes = workspace.component_hashes(self.repo, base, mutant, brick)
+                            shutil.copytree(ws.code, code, dirs_exist_ok=True)
+                            mutate.mutate(code / "bricks" / brick, strength, seed * 1000 + strength)
+                            mutant.hashes = workspace.component_hashes(self.repo, mutant)
                             result = self.evaluate(brick, splits.DEVELOPMENT, overlays, base=base, ws=mutant,
                                                    kind="defect-mutant")
                             raw[strength].append(result.get("terms", {}).get(policy.metric))

@@ -15,6 +15,8 @@ Commands (stdin {"command", "brick", ...}):
 from __future__ import annotations
 
 import importlib
+import json
+import math
 from pathlib import Path
 import sys
 import traceback
@@ -52,12 +54,20 @@ def main() -> None:
         return
     command = payload["command"]
     if command == "gates":
-        finish(stream, {"gates": [list(g) for g in getattr(module, "GATES", ())]})
+        try:
+            gates = [list(g) for g in getattr(module, "GATES", ())]
+            json.dumps(gates)
+        except Exception:
+            finish(stream, {"fatal": "GATES is not a list of (term, operator, threshold)"})
+            return
+        finish(stream, {"gates": gates})
     elif command == "build":
         inputs = []
         for record in payload["records"]:
             try:
-                inputs.append({"input": module.build(record)})
+                built = module.build(record)
+                json.dumps(built)
+                inputs.append({"input": built})
             except Exception:
                 inputs.append(failure())
         finish(stream, {"inputs": inputs})
@@ -65,8 +75,11 @@ def main() -> None:
         scores = []
         for item in payload["items"]:
             try:
-                terms = module.score(item["record"], item["output"], item["later"])
-                scores.append({"terms": {str(k): float(v) for k, v in dict(terms).items()}})
+                terms = {str(k): float(v) for k, v in dict(module.score(item["record"], item["output"], item["later"])).items()}
+                bad = [k for k, v in terms.items() if not math.isfinite(v)]
+                if bad:
+                    raise ValueError(f"score() returned non-finite terms: {bad}")
+                scores.append({"terms": terms})
             except Exception:
                 scores.append(failure())
         finish(stream, {"scores": scores})

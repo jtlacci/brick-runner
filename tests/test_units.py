@@ -11,6 +11,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from brick_runner import mutate, splits  # noqa: E402
+from brick_runner.broker import Broker, CaseState  # noqa: E402
 from brick_runner.hashing import digest  # noqa: E402
 from brick_runner.store import Store, StoreError  # noqa: E402
 
@@ -41,12 +42,37 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(list((self.root / "records").glob("*.jsonl"))), 1)
         self.assertEqual(Store(self.root).record(first[0])["input"], {"q": 1})
 
-    def test_datasets_pin_record_ids(self) -> None:
-        ids = self.store.add_records([{"kind": "run", "n": i, "time": str(i)} for i in range(3)])
-        key = self.store.create_dataset(reversed(ids))
-        self.assertEqual(self.store.dataset(key), sorted(ids))
+    def test_datasets_pin_runs_and_their_exchanges(self) -> None:
+        runs = self.store.add_records([{"kind": "run", "trace_id": f"t{i}", "time": f"2026-01-0{i + 1}"} for i in range(3)])
+        [pinned_exchange] = self.store.add_records([{"kind": "exchange", "trace_id": "t0", "time": "2026-01-01"}])
+        key = self.store.create_dataset(reversed(runs))
+        self.assertEqual(self.store.dataset(key), sorted(runs + [pinned_exchange]))
+        # An exchange added to the same trace later is not part of the pinned dataset.
+        [late] = self.store.add_records([{"kind": "exchange", "trace_id": "t0", "time": "2026-02-01"}])
+        self.assertNotIn(late, self.store.dataset(key))
+        self.assertEqual([e["id"] for e in self.store.exchanges("t0", set(self.store.dataset(key)))], [pinned_exchange])
         with self.assertRaises(StoreError):
             self.store.create_dataset(["sha256:" + "0" * 64])
+
+    def test_the_caller_sets_the_source_and_times_are_normalised(self) -> None:
+        [rid] = self.store.add_records([{"kind": "run", "source": "live", "time": "2026-01-01T05:00:00+05:00"}],
+                                       source="synthetic")
+        record = self.store.record(rid)
+        self.assertEqual(record["source"], "synthetic")
+        self.assertEqual(record["time"], "2026-01-01T00:00:00.000000+00:00")
+
+
+@unittest.skipUnless(shutil.which("dvc"), "dvc is not on PATH")
+class DvcSyncTests(unittest.TestCase):
+    def test_sync_pins_the_store_in_git(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        store = Store(root)
+        store.add_records([{"kind": "run", "time": "2026-01-01", "input": {"a": 1}}])
+        store.sync()
+        self.assertTrue((root / "payloads.dvc").exists())
+        log = __import__("subprocess").run(["git", "log", "--oneline"], cwd=root, capture_output=True, text=True).stdout
+        self.assertIn("sync evaluation data", log)
 
 
 class SplitTests(unittest.TestCase):
@@ -76,45 +102,46 @@ class SplitTests(unittest.TestCase):
         self.assertTrue(parts[splits.HOLDOUT])
 
 
-class ReplayTests(unittest.TestCase):
-    """The candidate worker's replay rules, with a stand-in runtime."""
+class BrokerTests(unittest.TestCase):
+    """The parent-side replay rules. Dependency workers are replaced by a stand-in."""
 
-    def setUp(self) -> None:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "brick_runner/workers"))
-        import candidate
+    class FakeBroker(Broker):
+        def __init__(self, sibling_output: dict) -> None:
+            super().__init__(sandbox=None, dependencies=Path("."), deterministic=lambda b: b == "det",
+                             deadline=0)
+            self.sibling_output = sibling_output
 
-        class Runtime:
-            class OutOfEvidence(LookupError):
-                pass
+        def dependency(self, brick):
+            return "dependency-worker"
 
-            digest = staticmethod(digest)
+        def run_case(self, worker, payload, state):
+            assert worker == "dependency-worker"
+            return {"output": self.sibling_output}
 
-            @staticmethod
-            def is_deterministic(brick: str) -> bool:
-                return brick == "det"
+    def state(self, *exchanges: dict) -> CaseState:
+        return CaseState.from_exchanges([{**e, "request_hash": digest(e["request"])} for e in exchanges])
 
-        self.runtime = Runtime
-        self.Replay = candidate.Replay
-
-    def replay(self, *exchanges: dict):
-        return self.Replay([{**e, "request_hash": digest(e["request"])} for e in exchanges], self.runtime)
-
-    def test_external_replays_or_is_out_of_evidence(self) -> None:
-        replay = self.replay({"name": "external:p", "request": {"s": 1}, "response": {"v": 2}})
-        self.assertEqual(replay.external("p", {"s": 1}, None), {"v": 2})
-        with self.assertRaises(self.runtime.OutOfEvidence):
-            replay.external("p", {"s": 9}, None)
+    def test_external_replays_then_runs_out(self) -> None:
+        broker = self.FakeBroker({})
+        state = self.state({"name": "external:p", "request": {"s": 1}, "response": {"v": 2}})
+        self.assertEqual(broker._external(state, {"name": "p", "request": {"s": 1}}), {"response": {"v": 2}})
+        self.assertFalse(state.out_of_evidence)
+        # One recording answers one call; a second identical call is out of evidence.
+        self.assertEqual(broker._external(state, {"name": "p", "request": {"s": 1}})["raise"], "out_of_evidence")
+        self.assertTrue(state.out_of_evidence)
 
     def test_deterministic_sibling_is_recomputed_and_checked(self) -> None:
-        replay = self.replay({"name": "sibling:det", "request": {"q": 1}, "response_hash": digest({"a": 1})})
-        self.assertEqual(replay.sibling("det", {"q": 1}, lambda r: {"a": 2}), {"a": 2})
-        self.assertEqual(len(replay.mismatches), 1)
+        broker = self.FakeBroker({"a": 2})
+        state = self.state({"name": "sibling:det", "request": {"q": 1}, "response_hash": digest({"a": 1})})
+        self.assertEqual(broker._sibling(state, {"brick": "det", "request": {"q": 1}}), {"response": {"a": 2}})
+        self.assertEqual(state.mismatches, 1)
 
     def test_nondeterministic_sibling_replays_or_regenerates(self) -> None:
-        replay = self.replay({"name": "sibling:model", "request": {"q": 1}, "response": {"p": 0.3}})
-        self.assertEqual(replay.sibling("model", {"q": 1}, lambda r: {"p": 0.9}), {"p": 0.3})
-        self.assertEqual(replay.sibling("model", {"q": 2}, lambda r: {"p": 0.9}), {"p": 0.9})
-        self.assertEqual(replay.regenerated, [{"name": "sibling:model", "request": {"q": 2}, "response": {"p": 0.9}}])
+        broker = self.FakeBroker({"p": 0.9})
+        state = self.state({"name": "sibling:model", "request": {"q": 1}, "response": {"p": 0.3}})
+        self.assertEqual(broker._sibling(state, {"brick": "model", "request": {"q": 1}}), {"response": {"p": 0.3}})
+        self.assertEqual(broker._sibling(state, {"brick": "model", "request": {"q": 2}}), {"response": {"p": 0.9}})
+        self.assertEqual(state.regenerated, 1)
 
 
 class MutateTests(unittest.TestCase):

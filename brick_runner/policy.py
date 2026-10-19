@@ -7,8 +7,7 @@ from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Any
 
-import yaml
-
+from . import policy_check
 from .gitrepo import Repo
 
 ALWAYS_HUMAN = ("contract.py", "evaluation/policy.yml", "evaluation/data.lock", "evaluation/AGENTS.md")
@@ -43,6 +42,10 @@ class Policy:
     def horizon(self) -> float:
         return float(self.raw.get("label_horizon_seconds", 0))
 
+    @property
+    def max_out_of_evidence(self) -> float:
+        return float(self.raw.get("max_out_of_evidence", 0.05))
+
     def classify(self, path: str) -> str:
         if path in ALWAYS_HUMAN:
             return HUMAN
@@ -58,12 +61,13 @@ def load_policy(repo: Repo, commit: str, brick: str) -> Policy:
     text = repo.show(commit, f"bricks/{brick}/evaluation/policy.yml")
     if text is None:
         raise PolicyError(f"bricks/{brick} has no evaluation policy at {commit[:12]}")
-    raw = yaml.safe_load(text)
-    for key in ("surfaces", "code_loop", "eval_loop", "split", "selection", "seeds"):
-        if key not in (raw or {}):
-            raise PolicyError(f"policy for {brick} at {commit[:12]} lacks {key!r}; run the framework linter")
-    if raw["selection"].get("method") != "best":
-        raise PolicyError(f"selection method {raw['selection'].get('method')!r} is not supported")
+    try:
+        raw = policy_check.load(text)
+    except ValueError as exc:
+        raise PolicyError(f"policy for {brick} at {commit[:12]} cannot be parsed: {exc}") from exc
+    problems = policy_check.check(raw)
+    if problems:
+        raise PolicyError(f"policy for {brick} at {commit[:12]} is invalid: {'; '.join(problems)}")
     return Policy(raw)
 
 
