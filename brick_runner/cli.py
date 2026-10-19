@@ -45,8 +45,11 @@ def main(argv: list[str] | None = None) -> int:
     change.add_argument("--brick", required=True)
     change.add_argument("--commit", required=True)
 
-    for name, text in (("holdout", "run the holdout for the best candidate"), ("promote", "promote the holdout winner"),
-                       ("trials", "list this brick's trials")):
+    holdout = commands.add_parser("holdout", help="run the holdout for the best candidate")
+    holdout.add_argument("--brick", required=True)
+    holdout.add_argument("--rerun-reason", help="a human's recorded reason to run a candidate's holdout again")
+
+    for name, text in (("promote", "promote the holdout winner"), ("trials", "list this brick's trials")):
         sub = commands.add_parser(name, help=text)
         sub.add_argument("--brick", required=True)
 
@@ -89,7 +92,7 @@ def dispatch(args: argparse.Namespace) -> dict:
     if args.command == "evaluation-change":
         return runner.evaluation_change(args.brick, args.commit)
     if args.command == "holdout":
-        return runner.holdout(args.brick)
+        return runner.holdout(args.brick, args.rerun_reason)
     if args.command == "promote":
         return runner.promote(args.brick)
     if args.command == "trials":

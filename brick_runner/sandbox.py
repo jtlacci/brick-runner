@@ -4,10 +4,11 @@ Each worker runs in new user, network and mount namespaces:
 
 - no network;
 - its own workspace copy, mounted at /mnt, is the only tree it works in;
-- /tmp, the runner's state folder and the brick repository are hidden behind
-  empty tmpfs mounts, so a worker cannot read the signing key, the store, the
-  ledger or another worker's workspace;
-- the Python environment and the worker scripts are mounted read-only.
+- /tmp, /dev/shm, /var/tmp, the runner's state folder and the brick
+  repository are hidden behind empty private tmpfs mounts, so a worker cannot
+  read the signing key, the store, the ledger or another worker's workspace;
+- every other mount, including the runner's own source and the Python
+  environment, is remounted read-only, so a worker cannot change the host.
 
 The workers also install an audit hook that refuses sockets and subprocesses.
 Without namespaces the runner refuses to run, unless BRICK_RUNNER_UNSANDBOXED=1
@@ -38,12 +39,17 @@ ws="$1"; shift
 mount --rbind "$ws" /mnt
 while [ "$1" != "--" ]; do
   case "$1" in
-    ro:*) p="${1#ro:}"; if [ -d "$p" ]; then mount --bind "$p" "$p"; mount -o remount,bind,ro "$p"; fi ;;
     hide:*) p="${1#hide:}"; if [ -d "$p" ]; then mount -t tmpfs -o size=4m tmpfs "$p"; fi ;;
   esac
   shift
 done
 shift
+# Everything except the worker's own tree becomes read-only: the runner's
+# source, the Python environment, /root, /etc, /dev/shm (now a private tmpfs).
+for m in $(awk '{print $2}' /proc/self/mounts | sort -u); do
+  case "$m" in /mnt|/mnt/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/pts) continue ;; esac
+  mount -o remount,bind,ro "$m" 2>/dev/null || { echo "sandbox: cannot make $m read-only" >&2; exit 97; }
+done
 cd /mnt
 exec "$@"
 '''
@@ -62,7 +68,7 @@ def isolation() -> bool:
     try:
         probe = subprocess.run(
             ["unshare", "--net", "--mount", "--map-root-user", "--propagation", "private",
-             "sh", "-c", "mount -t tmpfs tmpfs /mnt && mount --bind /mnt /mnt && mount -o remount,bind,ro /mnt"],
+             "sh", "-c", "mount -t tmpfs tmpfs /mnt && mount -o remount,bind,ro /"],
             capture_output=True, timeout=10)
         return probe.returncode == 0
     except (OSError, subprocess.SubprocessError):
@@ -88,9 +94,8 @@ class Sandbox:
         if self.unsandboxed:
             return [*python, str(workspace)], str(workspace)
         keep = {Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve(), WORKERS}
-        hide = {Path(tempfile.gettempdir()).resolve(), *self.hide}
-        args = [*(f"ro:{p}" for p in sorted(keep)),
-                *(f"hide:{p}" for p in sorted(hide) if not any(_inside(k, p) for k in keep))]
+        hide = {Path(tempfile.gettempdir()).resolve(), Path("/dev/shm"), Path("/var/tmp"), *self.hide}
+        args = [f"hide:{p}" for p in sorted(hide) if not any(_inside(k, p) for k in keep)]
         return (["unshare", "--net", "--mount", "--map-root-user", "--propagation", "private",
                  "sh", "-c", WRAPPER, "sandbox", str(workspace), *args, "--", *python, MOUNT_POINT],
                 MOUNT_POINT)

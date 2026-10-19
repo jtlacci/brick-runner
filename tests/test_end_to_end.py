@@ -151,6 +151,29 @@ class Scenario(unittest.TestCase):
         self.assertNotIn("LEAK", view["log"])
         self.assertIn("BLOCKED", view["log"])
 
+    def test_09e_candidate_cannot_change_the_host(self) -> None:
+        engine = Path(sys.modules["brick_runner.engine"].__file__)
+        marker = self.tmp / "planted"
+        before = engine.read_bytes()
+        writer = (
+            "import sys\n\n"
+            f"for path in [{str(engine)!r}, {str(Path.home() / '.gitconfig-planted')!r}, {str(marker)!r}]:\n"
+            "    try:\n"
+            "        with open(path, 'a') as handle:\n"
+            "            handle.write('# planted')\n"
+            "        print('WROTE', path, file=sys.stderr)\n"
+            "    except OSError as exc:\n"
+            "        print('BLOCKED', type(exc).__name__, file=sys.stderr)\n\n\n"
+            "def execute(inputs, ctx):\n"
+            "    return {'action': 'hold'}\n"
+        )
+        commit = self.branch("writer", {"bricks/signal/src/logic.py": writer})
+        view = self.runner.submit("signal", commit, "development")
+        self.assertNotIn("WROTE", view["log"])
+        self.assertEqual(engine.read_bytes(), before)
+        self.assertFalse((Path.home() / ".gitconfig-planted").exists())
+        self.assertFalse(marker.exists())
+
     def test_09c_candidate_cannot_declare_its_own_cases_out_of_evidence(self) -> None:
         fake = fixture.SIGNAL_CORRECT.replace(
             "from ..input.adapters import market_data",
@@ -226,11 +249,27 @@ class Scenario(unittest.TestCase):
         check = self.runner.ledger.envelope(bundle["dependents"]["signal"]["trial"])
         self.assertIn("dependency:market_data", check["identity"]["hashes"])
 
-    def test_13_time_split_holdout_waits_for_new_data(self) -> None:
+    def test_13_a_candidate_gets_one_holdout_in_any_epoch(self) -> None:
+        # The data.lock commit in test 10 started a new epoch. The correct candidate
+        # already used its holdout in test 6, so a new epoch does not earn another.
+        self.assertTrue(self.runner.submit("signal", self.correct, "validation")["passed"])
+        again = self.runner.holdout("signal")
+        self.assertIn("only a human can grant another", again["note"])
+        # A human grants a second run, and the ledger records why.
+        granted = self.runner.holdout("signal", rerun_reason="data.lock moved to real captured data")
+        self.assertTrue(granted["passed"])
+        [entry] = self.runner.ledger.find("signal", kind="trial", split="holdout",
+                                         rerun_reason="data.lock moved to real captured data")
+        self.assertEqual(entry.tag("candidate"), self.correct)
+
+    def test_14_time_split_holdout_waits_for_new_data(self) -> None:
         path = self.root / "bricks/signal/evaluation/policy.yml"
         path.write_text(path.read_text().replace("kind: hash", "kind: time"))
         fixture.commit(self.root, "signal: forward holdout")
-        self.assertTrue(self.runner.submit("signal", self.correct, "validation")["passed"])
+        renamed = fixture.SIGNAL_CORRECT.replace("price = market_data", "latest = market_data").replace(
+            "if price <", "if latest <")
+        commit = self.branch("renamed", {"bricks/signal/src/logic.py": renamed})
+        self.assertTrue(self.runner.submit("signal", commit, "validation")["passed"])
         result = self.runner.holdout("signal")
         self.assertEqual(result["status"], "waiting")
         self.assertEqual(result["have"], 0)

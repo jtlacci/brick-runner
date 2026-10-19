@@ -145,7 +145,7 @@ class Runner:
 
     def evaluate(self, brick: str, split: str, overlays: list[Overlay], *, base: str | None = None,
                  freeze: str | None = None, kind: str = "trial", tags: dict[str, Any] | None = None,
-                 cache: bool = True, ws: Workspace | None = None) -> dict[str, Any]:
+                 cache: bool = True, ws: Workspace | None = None, rerun_reason: str | None = None) -> dict[str, Any]:
         base = base or self.base()
         policy = load_policy(self.repo, base, brick)
         own = ws is None
@@ -168,10 +168,12 @@ class Runner:
                         "evidence": evidence, "seeds": policy.seeds,
                         "policy": self.repo.tree(base, f"bricks/{brick}/evaluation/policy.yml")}
             eval_id = digest(identity)
-            holdout_key = digest({"hashes": ws.hashes, "evidence": evidence})
             if split == splits.HOLDOUT:
-                used = self.ledger.find(brick, kind="trial", split=splits.HOLDOUT, holdout_key=holdout_key)
-                if used:
+                # One holdout run per candidate code, in any epoch and on any evidence.
+                # Waiting for new data or a new base never earns a second run; only a
+                # human, with a recorded reason, can grant one.
+                used = self.ledger.find(brick, kind="trial", split=splits.HOLDOUT, code=ws.hashes["code"])
+                if used and not rerun_reason:
                     return {"status": "used", "passed": used[0].tag("passed") == "True", "trial": used[0].run_id}
             if cache:
                 hits = self.ledger.find(brick, eval_id=eval_id, kind=kind)
@@ -184,8 +186,10 @@ class Runner:
                              "time": now(), "sandboxed": not self.sandbox.unsandboxed,
                              "synthetic": load_lock(self.repo, base, brick) == "unpinned"})
             entry_tags = {"eval_id": eval_id, "split": split, "epoch": self.epoch(brick, base), "base": base,
-                          "passed": envelope["passed"], "metric": policy.metric, "holdout_key": holdout_key,
+                          "passed": envelope["passed"], "metric": policy.metric,
                           "code": ws.hashes["code"], **(tags or {})}
+            if rerun_reason:
+                entry_tags["rerun_reason"] = rerun_reason
             for overlay in ws.overlays:
                 entry_tags[f"{overlay.kind}:{overlay.brick}"] = overlay.commit
             envelope["trial"] = self.ledger.write(brick, kind, entry_tags, envelope["terms"], envelope)
@@ -298,8 +302,12 @@ class Runner:
                                      tags={"loop": "code", "candidate": commit, "freeze": freeze})
         return self.view(envelope, split)
 
-    def holdout(self, brick: str) -> dict[str, Any]:
-        """Select the best validation trial of this epoch and run its one holdout."""
+    def holdout(self, brick: str, rerun_reason: str | None = None) -> dict[str, Any]:
+        """Select the best validation trial of this epoch and run its one holdout.
+
+        ``rerun_reason`` is a human decision to run a candidate's holdout a second
+        time (for example after a real change of the base). It is recorded.
+        """
         with self.exclusive():
             base = self.base()
             epoch = self.epoch(brick, base)
@@ -312,12 +320,12 @@ class Runner:
             best = max(trials, key=lambda t: (t.metrics[metric], -t.start_time))
             candidate = best.tag("candidate")
             envelope = self.evaluate(brick, splits.HOLDOUT, [Overlay(brick, CODE, candidate)], base=base,
-                                     freeze=best.tag("freeze"), cache=False,
+                                     freeze=best.tag("freeze"), cache=False, rerun_reason=rerun_reason,
                                      tags={"loop": "code", "candidate": candidate, "freeze": best.tag("freeze"),
                                            "selected_from": best.run_id})
             if envelope.get("status") == "used":
                 return {"passed": envelope["passed"], "candidate": candidate,
-                        "note": "this candidate already used its holdout run on this evidence"}
+                        "note": "this candidate already used its holdout run; only a human can grant another"}
             if envelope.get("status") == "waiting":
                 return {**envelope, "candidate": candidate}
             claim = {"trial": envelope["trial"], "eval_id": envelope["eval_id"], "passed": envelope["passed"],
@@ -329,7 +337,16 @@ class Runner:
                 "holdout_runs_this_epoch": holdout_runs}
 
     def _verified_holdout(self, brick: str, epoch: str) -> tuple[Entry, dict[str, Any]]:
+        """The newest signed, passing holdout of this epoch that counts.
+
+        A holdout counts only if it was its code's first holdout run, or a
+        human granted the run with a recorded reason.
+        """
         for entry in self.ledger.find(brick, kind="trial", split="holdout", epoch=epoch, passed="True"):
+            runs = self.ledger.find(brick, kind="trial", split="holdout", code=entry.tag("code"))
+            first = min(runs, key=lambda r: r.start_time).run_id == entry.run_id
+            if not (first or entry.tag("rerun_reason")):
+                continue
             envelope = self.ledger.envelope(entry.run_id)
             claim = {"trial": entry.run_id, "eval_id": envelope["eval_id"], "passed": True,
                      "candidate": entry.tag("candidate"), "epoch": epoch}
@@ -349,7 +366,8 @@ class Runner:
         if current != envelope["identity"]["hashes"]:
             changed = sorted(k for k in set(current) | set(envelope["identity"]["hashes"])
                              if current.get(k) != envelope["identity"]["hashes"].get(k))
-            raise RunnerError(f"the base changed since the holdout ({', '.join(changed)}); run holdout again")
+            raise RunnerError(f"the base changed since the holdout ({', '.join(changed)}); "
+                              "a human may grant a new holdout run with a recorded reason")
         if not self.ledger.find(brick, kind="defect-check", eval_tree=epoch, passed="True"):
             report = self.defect_check(brick, impl_commit=candidate, eval_commit=base)
             if not report["passed"]:
