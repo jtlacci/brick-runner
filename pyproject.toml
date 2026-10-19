@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brick-runner"
+version = "0.1.0"
+description = "The trusted evaluation runner for brick-framework repositories"
+requires-python = ">=3.11"
+dependencies = ["mlflow>=3.7", "dvc>=3.50", "pyyaml>=6"]
+
+[project.scripts]
+brick-runner = "brick_runner.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["brick_runner*"]
