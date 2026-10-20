@@ -1,0 +1,33 @@
+# systemd unit for the polling service. Copy to /etc/systemd/system/, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now brick-runner
+# Logs: journalctl -u brick-runner -f   (one JSON object per line)
+
+[Unit]
+Description=brick-runner: evaluate pull requests for a brick repository
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=brick-runner
+Group=brick-runner
+# Holds BRICK_RUNNER_GITHUB_TOKEN and the AWS credentials (or use an instance role).
+# chmod 600, owned by brick-runner. Never commit it.
+EnvironmentFile=/etc/brick-runner/env
+Environment=BRICK_RUNNER_HOME=/var/lib/brick-runner
+ExecStart=/opt/brick-runner/venv/bin/brick-runner serve \
+    --github jtlacci/YOUR-BRICK-REPO \
+    --allow jtlacci \
+    --interval 60 \
+    --sync-every 600
+Restart=on-failure
+RestartSec=30
+
+# The runner needs user namespaces for its sandbox. Do not add
+# PrivateUsers=, RestrictNamespaces= or NoNewPrivileges= here: they block it.
+StateDirectory=brick-runner
+StateDirectoryMode=0700
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

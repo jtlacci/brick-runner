@@ -62,19 +62,6 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(record["time"], "2026-01-01T00:00:00.000000+00:00")
 
 
-@unittest.skipUnless(shutil.which("dvc"), "dvc is not on PATH")
-class DvcSyncTests(unittest.TestCase):
-    def test_sync_pins_the_store_in_git(self) -> None:
-        root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
-        store = Store(root)
-        store.add_records([{"kind": "run", "time": "2026-01-01", "input": {"a": 1}}])
-        store.sync()
-        self.assertTrue((root / "payloads.dvc").exists())
-        log = __import__("subprocess").run(["git", "log", "--oneline"], cwd=root, capture_output=True, text=True).stdout
-        self.assertIn("sync evaluation data", log)
-
-
 class SplitTests(unittest.TestCase):
     def records(self, n: int, source: str = "live") -> list[dict]:
         return [{"id": digest(i), "time": f"2026-01-01T00:00:{i:02d}+00:00", "source": source} for i in range(n)]

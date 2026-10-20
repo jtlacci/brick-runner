@@ -49,22 +49,50 @@ A case counts as out of evidence only when the parent refused a call. A brick th
 | Validation | Terms, gates and counts |
 | Holdout | Pass or fail |
 
+## How work reaches the runner
+
+The runner machine **pulls** work from GitHub with `brick-runner serve`. GitHub never pushes code to it, and no GitHub workflow runs on it, so a pull request cannot run its own code there outside the sandbox. To set up a machine, follow [deploy/SETUP.md](deploy/SETUP.md).
+
+Every minute the service:
+
+1. fetches the brick repository into its own bare clone;
+2. for each open pull request into `main` from the same repository with a new head commit, plans the change by the policy on `main`, then runs the code loop (`submit` on development and validation) or the evaluation loop (`evaluation-change`). A change with both fails;
+3. posts a `brick-runner` commit status and one comment, updated on each push;
+4. runs `/brick holdout <brick>`, `/brick holdout <brick> rerun: <reason>` and `/brick promote <brick>` comments, only from the GitHub logins in `--allow`, never from bots;
+5. backs up to S3 at most once every ten minutes.
+
+Make `brick-runner` a required status check on `main`.
+
 ## Commands
 
 ```sh
 brick-runner --repo <brick repo> --home <runner state> <command>
 
+serve --github owner/name --allow login[,login]                # the polling service
 submit --brick B --commit C [--split development|validation]   # code loop
 evaluation-change --brick B --commit C                         # evaluation loop
-holdout --brick B                                              # best validation trial, one holdout run
+holdout --brick B [--rerun-reason R]                           # best validation trial, one holdout run
 promote --brick B                                              # signed holdout, defect check, dependents
+plan --head C                                                  # which loop a change belongs to
 ingest --spool DIR                                             # captured records into the store
 dataset --brick B [--include-synthetic]                        # prints a data.lock value
-sync                                                           # DVC add and push of the store
 trials --brick B
+remote --url s3://bucket/prefix [--region R] [--git URL]       # set the backup remotes
+sync [--no-push]                                               # back up now
+restore --git URL                                              # rebuild --home on a new machine
 ```
 
 Each command prints one JSON object. The exit code is 0 for a pass, 1 for a fail and 2 for an error.
+
+## Backup
+
+| Data | Backup |
+| --- | --- |
+| Payloads, records, datasets (`store/`) | DVC: data to S3, pointer files to a private Git repository |
+| Ledger and bundles | A consistent snapshot goes into `store/ledger/`, tracked by DVC too |
+| `runner.key` | Never backed up here. Keep it in a secret manager. |
+
+Credentials are never written into a config file: DVC reads the usual AWS variables, profile or instance role, and Git uses the runner's GitHub token. `deploy/iam-policy.json` allows reads and writes but no deletes; turn on bucket versioning.
 
 ## The two loops
 
@@ -86,8 +114,11 @@ Everything lives under `--home`:
 | `mlflow.db`, `mlartifacts/` | The MLflow ledger: every trial, defect check and promotion |
 | `bundles/` | Promotion bundles |
 | `runner.key` | The key that signs holdout results and bundles |
+| `repo.git` | The service's bare clone of the brick repository |
+| `serve-state.json` | The head commit and comment of each pull request, and the commands already run |
+| `github-token` | Optional: the GitHub token, if it is not in `BRICK_RUNNER_GITHUB_TOKEN` |
 
-Neither MLflow nor the store is append-only. The runner must be the only writer, and agents must have no access to `--home`.
+Neither MLflow nor the store is append-only, but the S3 policy allows no deletes and bucket versioning keeps old objects. The runner must be the only writer, and agents must have no access to `--home`.
 
 ## Limits
 

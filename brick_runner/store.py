@@ -6,8 +6,8 @@ Layout under the store folder:
     records/<batch>.jsonl           records, with payload fields replaced by hashes
     datasets/<hex>.json             a sorted list of record IDs; its hash is the dataset version
 
-The folder is a DVC project: ``sync()`` runs ``dvc add`` and ``dvc push`` so the
-content is pinned in Git by DVC's pointer files and copied to the DVC remote.
+The folder is a DVC project (see backup.py): its content is pinned in Git by
+DVC's pointer files and copied to the DVC remote.
 DVC addresses files with MD5; the file names here are SHA-256, and the runner
 uses only the SHA-256 names.
 """
@@ -18,8 +18,6 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
-import shutil
-import subprocess
 from typing import Any, Iterable, Iterator
 
 from .hashing import canonical, digest
@@ -162,28 +160,7 @@ class Store:
             raise StoreError(f"dataset {key} does not match its hash")
         return ids
 
-    # ------------------------------------------------------------ DVC
-
-    def init_dvc(self) -> None:
-        if not (self.root / ".git").exists():
-            _run(["git", "init", "-q"], self.root)
-        if not (self.root / ".dvc").exists():
-            _run(["dvc", "init", "-q"], self.root)
-
-    def sync(self, *, push: bool = True) -> None:
-        """Pin the store in Git through DVC, and push it to the DVC remote if one is set."""
-        if not shutil.which("dvc"):
-            raise StoreError("dvc is not installed")
-        self.init_dvc()
-        _run(["dvc", "add", "-q", *DVC_TRACKED], self.root)
-        _run(["git", "add", *(f"{name}.dvc" for name in DVC_TRACKED), ".gitignore"], self.root)
-        status = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=self.root)
-        if status.returncode:
-            _run(["git", "-c", "user.name=brick-runner", "-c", "user.email=runner@localhost",
-                  "commit", "-qm", "sync evaluation data"], self.root)
-        remotes = subprocess.run(["dvc", "remote", "list"], cwd=self.root, capture_output=True, text=True)
-        if push and remotes.stdout.strip():
-            _run(["dvc", "push", "-q"], self.root)
+    # Backup to a DVC remote lives in backup.py.
 
 
 def normalise_time(value: Any) -> str:
@@ -196,11 +173,6 @@ def normalise_time(value: Any) -> str:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
-
-def _run(command: list[str], cwd: Path) -> None:
-    result = subprocess.run(command, cwd=cwd, capture_output=True, text=True)
-    if result.returncode:
-        raise StoreError(f"{' '.join(command)} failed: {result.stderr.strip()}")
 
 
 def ingest_spool(store: Store, spool: Path) -> int:
