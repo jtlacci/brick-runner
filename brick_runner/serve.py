@@ -242,6 +242,8 @@ class Service:
             lines.append(f"Human-only files changed (CODEOWNERS approval): {shown}" + (" …" if len(plan.human) > 20 else ""))
         if plan.new_bricks:
             lines.append("New bricks, evaluated after a human merges them: " + ", ".join(_code(b) for b in plan.new_bricks))
+        if plan.removed_bricks:
+            lines.append("Removed bricks (CODEOWNERS approval): " + ", ".join(_code(b) for b in plan.removed_bricks))
         if plan.mixed:
             lines.append("**Failed:** one change may contain code-loop files or evaluation-loop files, never both. "
                          f"Code: {', '.join(_code(b) for b in plan.code)}. "

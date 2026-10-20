@@ -208,6 +208,18 @@ class ServeTests(unittest.TestCase):
         self.service.cycle()
         self.assertEqual(self.github.final(sha)[1], "mixes code-loop and evaluation-loop files")
 
+    def test_12_a_brick_removed_whole_is_a_human_change(self) -> None:
+        fixture.git(self.work, "checkout", "-q", "-B", "pr12", "main")
+        fixture.git(self.work, "rm", "-rq", "bricks/signal")
+        sha = fixture.commit(self.work, "pr 12: remove signal")
+        fixture.git(self.work, "checkout", "-q", "main")
+        fixture.git(self.work, "push", "-q", "-f", str(self.origin), f"{sha}:refs/pull/12/head")
+        self.github.pulls.append({"number": 12, "head": {"sha": sha, "repo": {"full_name": REPO}},
+                                  "base": {"ref": "main"}})
+        self.service.cycle()
+        self.assertEqual(self.github.final(sha), ("success", "nothing to evaluate"))
+        self.assertIn("Removed bricks", self.github.bodies(12)[0])
+
 
 class RenderingTests(unittest.TestCase):
     def test_escaping_stops_markdown_html_and_mentions(self) -> None:
