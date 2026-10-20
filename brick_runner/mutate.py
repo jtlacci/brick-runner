@@ -10,8 +10,8 @@ A web brick's app (``app/src/``, JavaScript and TypeScript) gets text-level
 mutations of the same kinds: ``===``/``!==``, ``<=``/``>``, ``>=``/``<``,
 ``&&``/``||``, ``true``/``false``, numbers and quoted strings. Comment lines
 and import lines are never touched. ``<`` and ``>`` alone are left out,
-because in JSX they are tags. A mutant that no longer builds fails its
-evaluation, so it counts as caught.
+because in JSX they are tags. A mutant that no longer builds is neither caught
+nor missed; the defect check fails when most mutants do not build.
 """
 
 from __future__ import annotations

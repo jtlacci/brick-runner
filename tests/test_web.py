@@ -221,6 +221,26 @@ class WebScenario(unittest.TestCase):
         self.assertFalse(view["passed"])
         self.assertIn("package-lock.json refused", " ".join(view["reasons"]))
 
+    def test_07b_a_symlink_in_the_brick_is_refused(self) -> None:
+        fixture.git(self.root, "checkout", "-q", "-B", "link", "main")
+        (self.root / "bricks/web/app/src/secret").symlink_to("../../evaluation/evaluate.py")
+        commit = fixture.commit(self.root, "a link")
+        fixture.git(self.root, "checkout", "-q", "main")
+        with self.assertRaises(Exception) as caught:
+            self.runner.submit("web", commit, "development")
+        self.assertIn("symlinks are not allowed", str(caught.exception))
+
+    def test_07c_too_many_judge_requests_fail(self) -> None:
+        many = JUDGED.replace("return [{\"system\"", "return 9 * [{\"system\"")
+        self.assertNotEqual(many, JUDGED)
+        commit = self.branch("many", {"bricks/web/evaluation/evaluate.py": many})
+        env = {"BRICK_RUNNER_JUDGE_URL": f"http://127.0.0.1:{self.server.server_address[1]}/v1/messages",
+               "BRICK_RUNNER_JUDGE_KEY": str(self.tmp / "judge-key")}
+        with mock.patch.dict(os.environ, env):
+            result = self.runner.evaluate("web", "development", [], base=self.runner.repo.commit(commit), cache=False)
+        self.assertFalse(result["passed"])
+        self.assertIn("judge_requests() failed on some cases", result["reasons"])
+
     def test_08_the_judge_scores_and_is_cached(self) -> None:
         env = {"BRICK_RUNNER_JUDGE_URL": f"http://127.0.0.1:{self.server.server_address[1]}/v1/messages",
                "BRICK_RUNNER_JUDGE_KEY": str(self.tmp / "judge-key")}

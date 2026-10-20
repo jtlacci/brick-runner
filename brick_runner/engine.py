@@ -21,7 +21,7 @@ from typing import Any, Iterator
 from . import broker, mutate, splits, web, workspace
 from .gitrepo import Repo
 from .hashing import canonical, digest
-from .judge import Judge, JudgeError
+from .judge import MAX_REQUESTS_PER_CASE, MAX_REQUESTS_PER_EVALUATION, Judge, JudgeError
 from .ledger import Entry, Ledger, _metric_name
 from .policy import CODE, EVALUATION, Policy, contract_literal, dependents, load_lock, load_policy
 from .sandbox import Sandbox, SandboxError
@@ -185,6 +185,8 @@ class Runner:
             identity = {"brick": brick, "split": split, "hashes": ws.hashes, "dataset": dataset_key,
                         "evidence": evidence, "seeds": policy.seeds,
                         "policy": self.repo.tree(base, f"bricks/{brick}/evaluation/policy.yml")}
+            if self.kind(base, brick) == "web":
+                identity["toolchain"] = web.toolchain()
             eval_id = digest(identity)
             if split == splits.HOLDOUT:
                 # One holdout run per candidate code, in any epoch and on any evidence.
@@ -331,13 +333,18 @@ class Runner:
         model = made["judge"]["model"]
         counts.setdefault("judge_errors", 0)
         before = self.judge.calls
+        total = 0
         for item, requests in zip(items, made["requests"]):
-            if isinstance(requests, dict):
+            total += len(requests) if isinstance(requests, list) else 0
+            if isinstance(requests, dict) or len(requests) > MAX_REQUESTS_PER_CASE or total > MAX_REQUESTS_PER_EVALUATION:
                 counts["judge_errors"] += 1
-                examples.append({"record": item["record"]["id"], "stage": "judge", "error": requests.get("error")})
+                error = requests.get("error") if isinstance(requests, dict) else (
+                    f"more than {MAX_REQUESTS_PER_CASE} judge requests for one case, "
+                    f"or more than {MAX_REQUESTS_PER_EVALUATION} in one evaluation")
+                examples.append({"record": item["record"]["id"], "stage": "judge", "error": error})
                 item["judgments"] = []
                 continue
-            item["judgments"] = [self.judge.ask(model, request) for request in requests]
+            item["judgments"] = [self.judge.ask(model, request, ws.hashes["evaluation"]) for request in requests]
         counts["judge_calls"] = self.judge.calls - before
 
     # ------------------------------------------------------------ what each split may see
@@ -485,6 +492,7 @@ class Runner:
             else:
                 tolerance = 1e-9 + 0.01 * abs(base_value)
                 raw: dict[int, list[float | None]] = {}
+                unbuildable = {strength: 0 for strength in DEFECT_STRENGTHS}
                 for strength in DEFECT_STRENGTHS:
                     raw[strength] = []
                     for seed in DEFECT_SEEDS:
@@ -496,6 +504,9 @@ class Runner:
                             mutant.hashes = workspace.component_hashes(self.repo, mutant)
                             result = self.evaluate(brick, splits.DEVELOPMENT, overlays, base=base, ws=mutant,
                                                    kind="defect-mutant")
+                            if any(r.startswith("the web build failed") for r in result.get("reasons", [])):
+                                unbuildable[strength] += 1   # neither caught nor missed
+                                continue
                             raw[strength].append(result.get("terms", {}).get(policy.metric))
                         finally:
                             mutant.cleanup()
@@ -503,18 +514,22 @@ class Runner:
                 # detected, but not "more" detected than the worst scored mutant.
                 floor = min([v for vs in raw.values() for v in vs if v is not None] + [base_value])
                 for strength in DEFECT_STRENGTHS:
-                    values = [floor if v is None else v for v in raw[strength]]
+                    values = [floor if v is None else v for v in raw[strength]] or [base_value]
                     detected = sum(1 for v in values if v < base_value - tolerance)
                     report["strengths"][str(strength)] = {"median": statistics.median(values), "values": values,
                                                           "unscored": raw[strength].count(None),
+                                                          "unbuildable": unbuildable[strength],
                                                           "detected": detected, "of": len(values)}
                 medians = [report["strengths"][str(s)]["median"] for s in DEFECT_STRENGTHS]
                 monotonic = all(b <= a + tolerance for a, b in zip(medians, medians[1:]))
                 strongest = report["strengths"][str(DEFECT_STRENGTHS[-1])]
                 below = medians[-1] < base_value - tolerance
                 enough = strongest["detected"] * 2 >= strongest["of"]
-                report["passed"] = monotonic and below and enough
+                # Most mutants must build: otherwise the check measures the build, not the evaluation.
+                built = all(len(raw[s]) * 2 >= len(DEFECT_SEEDS) for s in DEFECT_STRENGTHS)
+                report["passed"] = monotonic and below and enough and built
                 report["reason"] = ("scores fall as defects grow" if report["passed"] else
+                                    "most mutants do not build, so the check cannot measure the evaluation" if not built else
                                     "scores do not fall steadily as defects grow" if not monotonic else
                                     "the strongest defects are not detected")
         self.ledger.write(brick, "defect-check", {"eval_tree": eval_tree or "", "impl": impl_commit,

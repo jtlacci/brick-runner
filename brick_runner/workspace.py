@@ -79,6 +79,16 @@ def _apply(repo: Repo, base: str, root: Path, overlay: Overlay) -> None:
         repo.export(overlay.commit, root, wanted)
 
 
+def _refuse_links(root: Path) -> None:
+    """A symlink under bricks/ is refused: a copy would follow it, and a worker would read its target."""
+    bricks = root / "bricks"
+    links = [p for p in bricks.rglob("*") if p.is_symlink()] if bricks.is_dir() else []
+    if links:
+        shutil.rmtree(root.parent, ignore_errors=True)
+        raise WorkspaceError("symlinks are not allowed in bricks/: "
+                             + ", ".join(p.relative_to(root).as_posix() for p in links[:5]))
+
+
 def _without_evaluation(root: Path) -> None:
     for folder in (root / "bricks").glob("*/evaluation"):
         shutil.rmtree(folder, ignore_errors=True)
@@ -88,6 +98,7 @@ def build(repo: Repo, base: str, overlays: list[Overlay], target: str) -> Worksp
     parent = Path(tempfile.mkdtemp(prefix="brick-ws-"))
     pristine = parent / "base"
     repo.export(base, pristine)
+    _refuse_links(pristine)
     trees = {}
     for name, chosen in (
         ("code", [o for o in overlays if o.kind == CODE]),
@@ -95,9 +106,10 @@ def build(repo: Repo, base: str, overlays: list[Overlay], target: str) -> Worksp
         ("evaluation", [o for o in overlays if o.kind == EVALUATION]),
     ):
         root = parent / name
-        shutil.copytree(pristine, root)
+        shutil.copytree(pristine, root, symlinks=True)
         for overlay in chosen:
             _apply(repo, base, root, overlay)
+        _refuse_links(root)
         if name != "evaluation":
             _without_evaluation(root)
         for cache in root.rglob("__pycache__"):

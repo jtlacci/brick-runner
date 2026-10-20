@@ -77,22 +77,28 @@ def serve(root: Path):
     return server
 
 
-def observe(stream, module, workspace: Path, payload: dict) -> None:
+def observe(stream, workspace: Path, payload: dict) -> None:
     root = workspace / BUILD_FOLDER
     if not (root / "index.html").is_file():
         finish(stream, {"fatal": "the built app has no index.html"})
-        return
-    if not hasattr(module, "observe"):
-        finish(stream, {"fatal": "a web brick's evaluate.py must define observe(input, browser, base_url)"})
         return
     from playwright.sync_api import sync_playwright
     server = serve(root)
     base_url = f"http://127.0.0.1:{server.server_address[1]}"
     driver = sync_playwright().start()
     browser = driver.chromium.launch(args=["--disable-dev-shm-usage"])
+    # The guard is armed before any evaluation code runs, its import included.
     arm()
     observations = []
     try:
+        try:
+            module = load(workspace, payload["brick"])
+        except Exception:
+            finish(stream, {"fatal": "cannot load evaluate.py:\n" + traceback.format_exc(limit=5)})
+            return
+        if not hasattr(module, "observe"):
+            finish(stream, {"fatal": "a web brick's evaluate.py must define observe(input, browser, base_url)"})
+            return
         for item in payload["inputs"]:
             try:
                 seen = module.observe(item, browser, base_url)
@@ -110,16 +116,16 @@ def observe(stream, module, workspace: Path, payload: dict) -> None:
 def main() -> None:
     payload, stream = start(armed=False)
     command = payload["command"]
-    if command != "observe":
-        arm()
+    if command == "observe":
+        observe(stream, Path(sys.argv[1]), payload)
+        return
+    arm()
     try:
         module = load(Path(sys.argv[1]), payload["brick"])
     except Exception:
         finish(stream, {"fatal": "cannot load evaluate.py:\n" + traceback.format_exc(limit=5)})
         return
-    if command == "observe":
-        observe(stream, module, Path(sys.argv[1]), payload)
-    elif command == "judge_requests":
+    if command == "judge_requests":
         if not hasattr(module, "judge_requests"):
             finish(stream, {"judge": None, "requests": None})
             return

@@ -5,7 +5,7 @@ evaluate.py pins the model (``JUDGE = {"model": ...}``) and builds each request
 "prompt", "max_tokens"?}``. The runner sends it to the Anthropic Messages API
 and gives the text answers to ``score(..., judgments=[...])``.
 
-Every answer is cached by a hash of (model, request), so the same evaluation on
+Every answer is cached by a hash of (evaluation version, model, request), so the same evaluation on
 the same evidence gets the same judgements, and a rerun costs nothing. A judge
 answer is nondeterministic, so the cache keeps it in full.
 
@@ -29,6 +29,8 @@ API_URL = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
 DEFAULT_MAX_TOKENS = 1024
 MAX_TOKENS_LIMIT = 8192
+MAX_REQUESTS_PER_CASE = 8
+MAX_REQUESTS_PER_EVALUATION = 500
 ATTEMPTS = 4
 
 
@@ -71,9 +73,10 @@ class Judge:
                              "(put the key in SSM and restart the runner)")
         return key
 
-    def ask(self, model: str, request: dict[str, Any]) -> str:
+    def ask(self, model: str, request: dict[str, Any], scope: str = "") -> str:
+        """``scope`` (the evaluation's hash) keeps answers from one evaluation version out of another."""
         body = {"model": model, **normalise(request)}
-        name = digest(body)[7:]
+        name = digest({"scope": scope, "body": body})[7:]
         cached = self.cache / f"{name}.json"
         if cached.exists():
             self.hits += 1

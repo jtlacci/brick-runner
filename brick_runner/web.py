@@ -90,6 +90,26 @@ def prefetch(app: Path, cache: Path, timeout: float = 900) -> None:
             raise BuildError("npm prefetch failed", (done.stdout + done.stderr)[-6000:])
 
 
+def toolchain() -> dict[str, str]:
+    """Versions that change a web evaluation: Node, npm, Playwright and its browsers."""
+    from importlib import metadata
+
+    def version(command: list[str]) -> str:
+        try:
+            return subprocess.run(command, capture_output=True, text=True, timeout=30).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return "missing"
+
+    browsers = os.environ.get("BRICK_RUNNER_BROWSERS") or os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or ""
+    try:
+        playwright = metadata.version("playwright")
+    except metadata.PackageNotFoundError:
+        playwright = "missing"
+    return {"node": version(["node", "--version"]), "npm": version(["npm", "--version"]),
+            "playwright": playwright,
+            "browsers": ",".join(sorted(p.name for p in Path(browsers).iterdir())) if browsers and Path(browsers).is_dir() else ""}
+
+
 def build(sandbox: Sandbox, code_root: Path, brick: str, into: Path, timeout: float = 900) -> str:
     """Build bricks/<brick>/app from the candidate tree; copy dist/ into ``into``. Returns the log."""
     if not shutil.which("npm"):
@@ -99,7 +119,10 @@ def build(sandbox: Sandbox, code_root: Path, brick: str, into: Path, timeout: fl
         raise BuildError(f"bricks/{brick}/{APP}/ is missing")
     with tempfile.TemporaryDirectory(prefix="brick-build-") as scratch:
         work = Path(scratch)
-        shutil.copytree(source, work / APP, ignore=shutil.ignore_patterns("node_modules", DIST))
+        links = [p for p in source.rglob("*") if p.is_symlink()]
+        if links:
+            raise BuildError("symlinks are not allowed in app/: " + ", ".join(p.name for p in links[:5]))
+        shutil.copytree(source, work / APP, symlinks=True, ignore=shutil.ignore_patterns("node_modules", DIST))
         prefetch(work / APP, work / ".npm-cache")
         script = ("cd app && npm ci --offline --no-audit --no-fund --cache ../.npm-cache "
                   "&& npm run build")
