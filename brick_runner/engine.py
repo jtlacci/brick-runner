@@ -18,9 +18,10 @@ import statistics
 import tempfile
 from typing import Any, Iterator
 
-from . import broker, mutate, splits, workspace
+from . import broker, mutate, splits, web, workspace
 from .gitrepo import Repo
 from .hashing import canonical, digest
+from .judge import Judge, JudgeError
 from .ledger import Entry, Ledger, _metric_name
 from .policy import CODE, EVALUATION, Policy, contract_literal, dependents, load_lock, load_policy
 from .sandbox import Sandbox, SandboxError
@@ -63,6 +64,7 @@ class Runner:
         self.key = self._key()
         # Workers never see the runner's state or the repository.
         self.sandbox = Sandbox(hide=[self.home, self.repo.path, *secret_paths()])
+        self.judge = Judge(self.home / "judgments")
 
     # ------------------------------------------------------------ basics
 
@@ -96,6 +98,11 @@ class Runner:
     @functools.lru_cache(maxsize=None)
     def _deterministic(self, base: str, brick: str) -> bool:
         return contract_literal(self.repo, base, brick, "DETERMINISTIC", False) is True
+
+    @functools.lru_cache(maxsize=None)
+    def kind(self, base: str, brick: str) -> str:
+        """"python" (the default) or "web" (KIND in contract.py)."""
+        return str(contract_literal(self.repo, base, brick, "KIND", "python"))
 
     def production(self, brick: str) -> Entry | None:
         found = self.ledger.find(brick, kind="promotion")
@@ -214,7 +221,8 @@ class Runner:
                   "score_errors": 0, "determinism_mismatches": 0, "regenerated": 0, "scored": 0}
         examples: list[dict[str, Any]] = []
         reasons: list[str] = []
-        gates = self._evaluator(ws, {"command": "gates"})["gates"]
+        declared = self._evaluator(ws, {"command": "gates"})
+        gates = declared["gates"]
         if not all(isinstance(g, list) and len(g) == 3 and isinstance(g[0], str) and g[1] in OPERATORS
                    and isinstance(g[2], (int, float)) and not isinstance(g[2], bool) for g in gates):
             raise RunnerError("GATES must be a tuple of (term, operator, threshold)")
@@ -230,8 +238,15 @@ class Runner:
             cases.append({"input": item["input"], "exchanges": record["exchanges"]})
             kept.append(record)
         try:
-            results, log = broker.run_cases(self.sandbox, brick, ws.code, ws.deps,
-                                            functools.partial(self._deterministic, base), cases)
+            if self.kind(base, brick) == "web":
+                results, log = self._run_web(brick, ws, cases)
+            else:
+                results, log = broker.run_cases(self.sandbox, brick, ws.code, ws.deps,
+                                                functools.partial(self._deterministic, base), cases)
+        except web.BuildError as exc:
+            return {"passed": False, "terms": {}, "gates": [], "counts": counts, "fatal": str(exc),
+                    "reasons": [f"the web build failed: {exc}"], "counterexamples": examples,
+                    "log": exc.log[-LOG_LIMIT:]}
         except SandboxError as exc:
             return {"passed": False, "terms": {}, "gates": [], "counts": counts, "fatal": str(exc),
                     "reasons": [f"the candidate worker failed: {exc}"], "counterexamples": examples,
@@ -250,6 +265,13 @@ class Runner:
             items.append({"record": record, "output": result.get("output"),
                           "later": self._later(record, policy.horizon)})
             outcomes.append((record, result))
+        if declared.get("judged") and items:
+            try:
+                self._judge(ws, items, counts, examples)
+            except JudgeError as exc:
+                return {"passed": False, "terms": {}, "gates": [], "counts": counts, "fatal": str(exc),
+                        "reasons": [f"the model judge failed: {exc}"], "counterexamples": examples[:50],
+                        "log": log[-LOG_LIMIT:]}
         scores = self._evaluator(ws, {"command": "score", "items": items})["scores"]
         per_case: list[tuple[dict[str, Any], dict[str, Any], dict[str, float]]] = []
         for (record, result), score in zip(outcomes, scores):
@@ -282,10 +304,41 @@ class Runner:
             reasons.append("a deterministic dependency gave a different result than recorded")
         if counts["score_errors"]:
             reasons.append("score() failed on some cases")
+        if counts.get("judge_errors"):
+            reasons.append("judge_requests() failed on some cases")
         if policy.metric not in means:
             reasons.append(f"no {policy.metric!r} term to rank by")
         return {"passed": not reasons, "terms": means, "gates": gate_results, "counts": counts,
                 "reasons": reasons, "counterexamples": examples[:50], "log": log[-LOG_LIMIT:]}
+
+    def _run_web(self, brick: str, ws: Workspace, cases: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+        """Build the candidate's app in the sandbox, then let evaluate.observe() look at it in Chromium."""
+        log = web.build(self.sandbox, ws.code, brick, ws.evaluation / web.BUILD_FOLDER)
+        if not cases:
+            return [], log
+        observed = self._evaluator(ws, {"command": "observe", "inputs": [c["input"] for c in cases]})["observations"]
+        results = []
+        for item in observed:
+            result = {"output": item["output"]} if "output" in item else {"error": item.get("error", "no observation")}
+            results.append({**result, "mismatches": 0, "regenerated": 0})
+        return results, log
+
+    def _judge(self, ws: Workspace, items: list[dict[str, Any]], counts: dict[str, int],
+               examples: list[dict[str, Any]]) -> None:
+        """Ask the pinned judge model for each request evaluate.judge_requests() makes."""
+        made = self._evaluator(ws, {"command": "judge_requests",
+                                    "items": [{"record": i["record"], "output": i["output"]} for i in items]})
+        model = made["judge"]["model"]
+        counts.setdefault("judge_errors", 0)
+        before = self.judge.calls
+        for item, requests in zip(items, made["requests"]):
+            if isinstance(requests, dict):
+                counts["judge_errors"] += 1
+                examples.append({"record": item["record"]["id"], "stage": "judge", "error": requests.get("error")})
+                item["judgments"] = []
+                continue
+            item["judgments"] = [self.judge.ask(model, request) for request in requests]
+        counts["judge_calls"] = self.judge.calls - before
 
     # ------------------------------------------------------------ what each split may see
 

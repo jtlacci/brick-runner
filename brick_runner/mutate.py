@@ -5,6 +5,13 @@ mutation point in the brick's code folders (``src/`` and ``input/adapters/``):
 comparison flips, arithmetic swaps, boolean flips, numeric shifts and string
 changes (field names, request keys). Docstrings are never touched. The same
 seed always gives the same mutant.
+
+A web brick's app (``app/src/``, JavaScript and TypeScript) gets text-level
+mutations of the same kinds: ``===``/``!==``, ``<=``/``>``, ``>=``/``<``,
+``&&``/``||``, ``true``/``false``, numbers and quoted strings. Comment lines
+and import lines are never touched. ``<`` and ``>`` alone are left out,
+because in JSX they are tags. A mutant that no longer builds fails its
+evaluation, so it counts as caught.
 """
 
 from __future__ import annotations
@@ -13,8 +20,14 @@ import ast
 from dataclasses import dataclass
 from pathlib import Path
 import random
+import re
 
 CODE_FOLDERS = ("src", "input/adapters")
+WEB_FOLDERS = ("app/src",)
+WEB_SUFFIXES = (".js", ".jsx", ".ts", ".tsx", ".mjs")
+JS_TOKEN = re.compile(r"===|!==|<=|>=|&&|\|\||\btrue\b|\bfalse\b|(?<![\w.$])\d+(?:\.\d+)?(?![\w.])|'[^'\\\n]*'|\"[^\"\\\n]*\"")
+JS_SWAPS = {"===": "!==", "!==": "===", "<=": ">", ">=": "<", "&&": "||", "||": "&&", "true": "false", "false": "true"}
+SKIP_LINE = re.compile(r"^\s*(//|/\*|\*|import\b|export\s.*\bfrom\b)")
 COMPARE_FLIPS = {ast.Lt: ast.GtE, ast.GtE: ast.Lt, ast.Gt: ast.LtE, ast.LtE: ast.Gt, ast.Eq: ast.NotEq, ast.NotEq: ast.Eq}
 BINOP_SWAPS = {ast.Add: ast.Sub, ast.Sub: ast.Add, ast.Mult: ast.Div, ast.Div: ast.Mult}
 
@@ -49,14 +62,41 @@ def _nodes(tree: ast.AST) -> list[ast.AST]:
 
 
 def _files(brick: Path) -> list[Path]:
-    return sorted(p for folder in CODE_FOLDERS if (brick / folder).is_dir() for p in (brick / folder).rglob("*.py"))
+    python = [p for folder in CODE_FOLDERS if (brick / folder).is_dir() for p in (brick / folder).rglob("*.py")]
+    script = [p for folder in WEB_FOLDERS if (brick / folder).is_dir() for p in (brick / folder).rglob("*")
+              if p.suffix in WEB_SUFFIXES and p.is_file()]
+    return sorted(python + script)
+
+
+def _js_spans(text: str) -> list[tuple[int, int]]:
+    spans, offset = [], 0
+    for line in text.splitlines(keepends=True):
+        if not SKIP_LINE.match(line):
+            spans += [(offset + m.start(), offset + m.end()) for m in JS_TOKEN.finditer(line)]
+        offset += len(line)
+    return spans
+
+
+def _js_replace(token: str, rng: random.Random) -> str:
+    if token in JS_SWAPS:
+        return JS_SWAPS[token]
+    if token[0] in "'\"":
+        return token[:-1] + "_mutated" + token[-1]
+    if "." in token:
+        return repr(float(token) * rng.choice((0.5, 1.5)) + rng.choice((-1.0, 1.0)) * 0.1)
+    value = int(token)
+    return str(value + rng.choice((-1, 1)) * max(1, abs(value) // 2))
+
+
+def _count(path: Path) -> int:
+    text = path.read_text(encoding="utf-8")
+    return len(_nodes(ast.parse(text))) if path.suffix == ".py" else len(_js_spans(text))
 
 
 def points(brick: Path) -> list[Point]:
     found = []
     for path in _files(brick):
-        count = len(_nodes(ast.parse(path.read_text(encoding="utf-8"))))
-        found += [Point(path.relative_to(brick).as_posix(), i) for i in range(count)]
+        found += [Point(path.relative_to(brick).as_posix(), i) for i in range(_count(path))]
     return found
 
 
@@ -84,6 +124,14 @@ def mutate(brick: Path, strength: int, seed: int) -> list[Point]:
     chosen = rng.sample(candidates, min(strength, len(candidates)))
     for file in sorted({p.file for p in chosen}):
         path = brick / file
+        if path.suffix != ".py":
+            text = path.read_text(encoding="utf-8")
+            spans = _js_spans(text)
+            for index in sorted((p.index for p in chosen if p.file == file), reverse=True):
+                start, end = spans[index]
+                text = text[:start] + _js_replace(text[start:end], rng) + text[end:]
+            path.write_text(text, encoding="utf-8")
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         nodes = _nodes(tree)
         for index in sorted(p.index for p in chosen if p.file == file):

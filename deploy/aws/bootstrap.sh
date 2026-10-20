@@ -35,7 +35,7 @@ status() { ssm_put status String "$1"; say "status: $1"; }
 say "packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-apt-get install -y -q git python3-venv openssl unzip curl
+apt-get install -y -q git python3-venv openssl unzip curl iproute2 nodejs npm
 if ! command -v aws >/dev/null; then
   curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscli.zip
   unzip -q /tmp/awscli.zip -d /tmp && /tmp/aws/install && rm -rf /tmp/aws /tmp/awscli.zip
@@ -58,6 +58,8 @@ say "installing brick-runner at $RUNNER_REF"
 python3 -m venv "$VENV"
 "$VENV/bin/pip" install -q --upgrade pip
 "$VENV/bin/pip" install -q "git+https://github.com/jtlacci/brick-runner.git@$RUNNER_REF"
+# Chromium for web bricks: root-owned and read-only to the service, outside its hidden home.
+PLAYWRIGHT_BROWSERS_PATH=/opt/brick-runner/browsers "$VENV/bin/playwright" install --with-deps chromium
 chown -R root:root /opt/brick-runner
 
 # ---------------------------------------------------------------- the runner's signing key
@@ -137,9 +139,19 @@ cat > /etc/brick-runner/env <<EOF
 BRICK_RUNNER_APP_ID=$APP_ID
 BRICK_RUNNER_INSTALLATION_ID=$INSTALLATION_ID
 BRICK_RUNNER_APP_KEY=/run/credentials/brick-runner.service/app-key
+BRICK_RUNNER_JUDGE_KEY=/run/credentials/brick-runner.service/judge-key
+BRICK_RUNNER_BROWSERS=/opt/brick-runner/browsers
 AWS_DEFAULT_REGION=$REGION
 EOF
 chmod 600 /etc/brick-runner/env
+
+# The model judge's API key (optional): a SecureString you put in $PARAMS/judge-key.
+# Without it the file is empty, and an evaluation that needs the judge fails with a clear reason.
+JUDGE_KEY="$(ssm_get judge-key)"
+[ "$JUDGE_KEY" = "None" ] && JUDGE_KEY=""
+printf '%s' "$JUDGE_KEY" > /etc/brick-runner/judge-key
+unset JUDGE_KEY
+chmod 600 /etc/brick-runner/judge-key
 
 # ---------------------------------------------------------------- backup remotes, or restore
 status "waiting for the evidence deploy key on $EVIDENCE_REPO (public key in $PARAMS/pub/evidence)"
@@ -170,6 +182,7 @@ User=brick-runner
 Group=brick-runner
 EnvironmentFile=/etc/brick-runner/env
 LoadCredential=app-key:/etc/brick-runner/app-key.pem
+LoadCredential=judge-key:/etc/brick-runner/judge-key
 Environment=BRICK_RUNNER_HOME=$HOME_DIR
 ExecStart=$VENV/bin/brick-runner serve --github $BRICK_REPO --allow $ALLOW --interval 60 --sync-every 600
 Restart=on-failure

@@ -15,6 +15,7 @@ Group=brick-runner
 EnvironmentFile=/etc/brick-runner/env
 # The GitHub App key, root-owned; the service reads it from $CREDENTIALS_DIRECTORY.
 LoadCredential=app-key:/etc/brick-runner/app-key.pem
+LoadCredential=judge-key:/etc/brick-runner/judge-key
 Environment=BRICK_RUNNER_HOME=/var/lib/brick-runner
 ExecStart=/opt/brick-runner/venv/bin/brick-runner serve \
     --github jtlacci/YOUR-BRICK-REPO \

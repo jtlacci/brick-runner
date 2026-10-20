@@ -137,7 +137,7 @@ def _snapshot_ledger(home: Path) -> None:
             source.backup(copy)
         source.close()
         copy.close()
-    for folder in ("mlartifacts", "bundles"):
+    for folder in ("mlartifacts", "bundles", "judgments"):
         if (home / folder).is_dir():
             shutil.copytree(home / folder, target / folder)
     if (home / "serve-state.json").exists():
@@ -187,7 +187,7 @@ def restore(home: Path, git: str) -> dict[str, Any]:
         raise StoreError(f"the backup was made from {recorded}; restore it to that path, not {home}")
     if (snapshot / "mlflow.db").exists():
         shutil.copy2(snapshot / "mlflow.db", home / "mlflow.db")
-    for folder in ("mlartifacts", "bundles"):
+    for folder in ("mlartifacts", "bundles", "judgments"):
         if (snapshot / folder).is_dir():
             shutil.copytree(snapshot / folder, home / folder, dirs_exist_ok=True)
     if (snapshot / "serve-state.json").exists():

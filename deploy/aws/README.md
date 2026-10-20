@@ -28,6 +28,7 @@ commit, then waits for three things, and publishes its progress in
 | `app-key` | SecureString | the instance |
 | `runner-key` | SecureString | the instance (the signing key, for restores) |
 | `pub/evidence` | String | the instance |
+| `judge-key` | SecureString | you, optional: the API key for the model judge; restart the instance's bootstrap step or the service after a change |
 
 **Restore:** launch a new instance with the same user data. It reuses the keys
 in SSM and, because the evidence repository already has a `main` branch,

@@ -63,6 +63,16 @@ awk '{o[$2]=$4} END {for (m in o) print m, o[m]}' /proc/self/mounts | while read
   done
   mount -o "remount,bind,ro$keep" "$m" 2>/dev/null || { echo "sandbox: cannot make $m read-only" >&2; exit 97; }
 done
+# A new network namespace has only a loopback interface, and it is down.
+# Builds and browser evaluations serve pages on 127.0.0.1, so start it.
+# Without iproute2, set IFF_UP with the SIOCGIFFLAGS and SIOCSIFFLAGS ioctls.
+if command -v ip >/dev/null 2>&1; then ip link set lo up
+elif command -v python3 >/dev/null 2>&1; then python3 -I -c "
+import fcntl, socket, struct
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+flags = struct.unpack('16sH14s', fcntl.ioctl(s, 0x8913, struct.pack('16sH14s', b'lo', 0, b'')))[1]
+fcntl.ioctl(s, 0x8914, struct.pack('16sH14s', b'lo', flags | 1, b''))"
+fi
 cd /mnt
 exec "$@"
 '''
@@ -106,17 +116,38 @@ class Sandbox:
         python = [sys.executable, "-I", "-B", str(WORKERS / script)]
         if self.unsandboxed:
             return [*python, str(workspace)], str(workspace)
-        keep = {Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve(), WORKERS}
+        return self.wrap([*python, MOUNT_POINT], workspace), MOUNT_POINT
+
+    def wrap(self, argv: list[str], workspace: Path) -> list[str]:
+        """argv run inside the namespaces, with the workspace at /mnt."""
+        keep = {Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve(), WORKERS, *tool_dirs()}
         hide = {Path(tempfile.gettempdir()).resolve(), Path("/dev/shm"), Path("/var/tmp"), *self.hide}
         args = [f"hide:{p}" for p in sorted(hide) if not any(_inside(k, p) for k in keep)]
-        return (["unshare", "--net", "--mount", "--map-root-user", "--propagation", "private",
-                 "sh", "-c", WRAPPER, "sandbox", str(workspace), *args, "--", *python, MOUNT_POINT],
-                MOUNT_POINT)
+        return ["unshare", "--net", "--mount", "--map-root-user", "--propagation", "private",
+                "sh", "-c", WRAPPER, "sandbox", str(workspace), *args, "--", *argv]
 
     @staticmethod
     def env() -> dict[str, str]:
-        return {"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONHASHSEED": "0", "LANG": "C.UTF-8",
-                "HOME": "/mnt", "TMPDIR": "/mnt"}
+        npm = shutil.which("npm")
+        extra = [str(Path(npm).parent)] if npm else []
+        path = ":".join(dict.fromkeys([*extra, "/usr/local/bin", "/usr/bin", "/bin"]))
+        env = {"PATH": path, "PYTHONHASHSEED": "0", "LANG": "C.UTF-8", "HOME": "/mnt", "TMPDIR": "/mnt"}
+        browsers = browsers_path()
+        if browsers:
+            env["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers)
+        return env
+
+    def run_command(self, argv: list[str], workspace: Path, *, timeout: float = 900) -> tuple[int, str]:
+        """A plain command (a build) in the sandbox, cwd /mnt. Returns (exit code, log)."""
+        command = argv if self.unsandboxed else self.wrap(argv, workspace)
+        env = self.env()
+        if self.unsandboxed:
+            env.update(HOME=str(workspace), TMPDIR=str(workspace))
+        try:
+            done = subprocess.run(command, capture_output=True, text=True, timeout=timeout, cwd=workspace, env=env)
+        except subprocess.TimeoutExpired as exc:
+            raise SandboxError(f"{argv[0]} exceeded {timeout:.0f}s", _text(exc.stdout) + _text(exc.stderr)) from exc
+        return done.returncode, (done.stdout[-4000:] + done.stderr[-8000:])
 
     def run(self, script: str, workspace: Path, payload: dict[str, Any], *, timeout: float = 600) -> tuple[dict[str, Any], str]:
         """A one-shot worker: payload on stdin, one result after the marker on stdout."""
@@ -203,6 +234,25 @@ class Process:
 
     def log_text(self) -> str:
         return "".join(self.log)[-8000:]
+
+
+def browsers_path() -> Path | None:
+    """Where Playwright's browsers are installed: BRICK_RUNNER_BROWSERS, else PLAYWRIGHT_BROWSERS_PATH."""
+    value = os.environ.get("BRICK_RUNNER_BROWSERS") or os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    return Path(value).resolve() if value else None
+
+
+def tool_dirs() -> list[Path]:
+    """Folders a worker needs that may sit under a hidden folder: Node's bin and the browsers."""
+    dirs = []
+    npm = shutil.which("npm")
+    if npm:
+        dirs.append(Path(npm).resolve().parent)
+        dirs.append(Path(npm).parent)
+    browsers = browsers_path()
+    if browsers:
+        dirs.append(browsers)
+    return dirs
 
 
 def _inside(path: Path, parent: Path) -> bool:
