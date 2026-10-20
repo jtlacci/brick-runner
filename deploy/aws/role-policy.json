@@ -1,0 +1,50 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListTheBackupPrefix",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::@@BUCKET@@",
+      "Condition": {"StringLike": {"s3:prefix": ["brick-runner/*", "brick-runner"]}}
+    },
+    {
+      "Sid": "ReadAndWriteBackupsButNeverDelete",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"],
+      "Resource": "arn:aws:s3:::@@BUCKET@@/brick-runner/*"
+    },
+    {
+      "Sid": "ReadItsParameters",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+      "Resource": "arn:aws:ssm:@@REGION@@:@@ACCOUNT@@:parameter/brick-runner/*"
+    },
+    {
+      "Sid": "WriteOnlyTheParametersItCreates",
+      "Effect": "Allow",
+      "Action": ["ssm:PutParameter"],
+      "Resource": [
+        "arn:aws:ssm:@@REGION@@:@@ACCOUNT@@:parameter/brick-runner/status",
+        "arn:aws:ssm:@@REGION@@:@@ACCOUNT@@:parameter/brick-runner/pub/*",
+        "arn:aws:ssm:@@REGION@@:@@ACCOUNT@@:parameter/brick-runner/runner-key",
+        "arn:aws:ssm:@@REGION@@:@@ACCOUNT@@:parameter/brick-runner/app-key",
+        "arn:aws:ssm:@@REGION@@:@@ACCOUNT@@:parameter/brick-runner/app-id",
+        "arn:aws:ssm:@@REGION@@:@@ACCOUNT@@:parameter/brick-runner/installation-id"
+      ]
+    },
+    {
+      "Sid": "DeleteTheOneTimeManifestCode",
+      "Effect": "Allow",
+      "Action": ["ssm:DeleteParameter"],
+      "Resource": "arn:aws:ssm:@@REGION@@:@@ACCOUNT@@:parameter/brick-runner/manifest-code"
+    },
+    {
+      "Sid": "UseTheDefaultSsmKeyThroughSsmOnly",
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"],
+      "Resource": "*",
+      "Condition": {"StringEquals": {"kms:ViaService": "ssm.@@REGION@@.amazonaws.com"}}
+    }
+  ]
+}

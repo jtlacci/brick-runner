@@ -1,5 +1,8 @@
 # Set up the runner machine
 
+On AWS, `deploy/aws/` does all of this: see [deploy/aws/README.md](aws/README.md).
+This guide is for any other Linux machine.
+
 The runner runs on its own Linux machine. It pulls work from GitHub; GitHub
 never pushes code to it, and no GitHub workflow runs on it. Allow about one hour.
 
@@ -37,9 +40,7 @@ sudo chmod 700 /var/lib/brick-runner
 ```sh
 sudo apt-get install -y git python3-venv openssl
 sudo python3 -m venv /opt/brick-runner/venv
-# brick-runner is a private repository: give pip a token with Contents: Read on it.
-sudo /opt/brick-runner/venv/bin/pip install \
-  "git+https://x-access-token:${GITHUB_TOKEN}@github.com/jtlacci/brick-runner@main"
+sudo /opt/brick-runner/venv/bin/pip install "git+https://github.com/jtlacci/brick-runner.git@<commit>"
 ```
 
 Root owns `/opt/brick-runner`, so neither the runner user nor anything it

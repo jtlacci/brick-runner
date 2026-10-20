@@ -1,0 +1,16 @@
+{
+  "name": "brick-runner-jtlacci",
+  "url": "https://github.com/jtlacci/brick-runner",
+  "description": "Evaluates brick pull requests and posts the brick-runner status.",
+  "public": false,
+  "redirect_url": "https://github.com/jtlacci/brick-runner",
+  "hook_attributes": {"url": "https://example.invalid/unused", "active": false},
+  "default_permissions": {
+    "contents": "read",
+    "pull_requests": "read",
+    "statuses": "write",
+    "issues": "write",
+    "metadata": "read"
+  },
+  "default_events": []
+}
