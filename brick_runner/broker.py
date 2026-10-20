@@ -31,6 +31,7 @@ from .sandbox import Process, Sandbox, SandboxError
 class CaseState:
     table: dict[tuple[str, str], list[dict[str, Any]]]
     used: dict[tuple[str, str], int] = field(default_factory=dict)
+    calls: list[dict[str, Any]] = field(default_factory=list)   # recorded exchanges the case used, in order
     out_of_evidence: bool = False
     mismatches: int = 0
     regenerated: int = 0
@@ -50,6 +51,7 @@ class CaseState:
         if index >= len(records):
             return None
         self.used[key] = index + 1
+        self.calls.append({"name": name, "request": request})
         return records[index]
 
 
@@ -145,7 +147,7 @@ def run_cases(sandbox: Sandbox, brick: str, candidate: Path, dependencies: Path,
             result = broker.run_case(worker, case["input"], state)
             if state.out_of_evidence:
                 result = {"out_of_evidence": True}
-            result.update(mismatches=state.mismatches, regenerated=state.regenerated)
+            result.update(mismatches=state.mismatches, regenerated=state.regenerated, calls=state.calls)
             results.append(result)
         worker.send({"op": "exit"})
     finally:

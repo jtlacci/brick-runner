@@ -161,10 +161,17 @@ def main() -> None:
                 inputs.append(failure())
         finish(stream, {"inputs": inputs})
     elif command == "score":
+        import inspect
+        try:
+            accepted = set(inspect.signature(module.score).parameters)
+        except (TypeError, ValueError):
+            accepted = set()
         scores = []
         for item in payload["items"]:
             try:
                 extra = {"judgments": item["judgments"]} if "judgments" in item else {}
+                if "calls" in accepted:
+                    extra["calls"] = item.get("calls", [])
                 scored = module.score(item["record"], item["output"], item["later"], **extra)
                 terms = {str(k): float(v) for k, v in dict(scored).items()}
                 bad = [k for k, v in terms.items() if not math.isfinite(v)]

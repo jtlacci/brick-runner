@@ -264,7 +264,7 @@ class Runner:
                 counts["run_errors"] += 1
                 examples.append({"record": record["id"], "stage": "run", "input": record.get("input"),
                                  "error": result["error"]})
-            items.append({"record": record, "output": result.get("output"),
+            items.append({"record": record, "output": result.get("output"), "calls": result.get("calls", []),
                           "later": self._later(record, policy.horizon)})
             outcomes.append((record, result))
         if declared.get("judged") and items:

@@ -130,6 +130,8 @@ A brick with `KIND = "web"` is a browser app in `app/`. For each evaluation the 
 
 The defect check mutates the app's JavaScript and TypeScript in `app/src/` (operators, booleans, numbers, strings), rebuilds and observes each mutant. A mutant that no longer builds counts as caught.
 
+`score()` may also take `calls`: the recorded exchanges the case used, in order, as `{"name", "request"}` (for example `sibling:store` with its request). An evaluation checks with it that a brick made the writes it must make, and in the right order.
+
 An `evaluate.py` with `JUDGE = {"model": ...}` and `judge_requests(record, output)` gets model judgements: the runner, outside the sandbox, sends each request to the Anthropic Messages API with the key in `BRICK_RUNNER_JUDGE_KEY` (a file), caches each answer by request in `<home>/judgments/`, and calls `score(..., judgments=[...])`. Without a key, an evaluation that needs the judge fails with that reason.
 
 Setup: `npm` on the runner's PATH, and Chromium from `playwright install --with-deps chromium` in a folder the service can read, named by `BRICK_RUNNER_BROWSERS`.
