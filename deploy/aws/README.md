@@ -9,16 +9,16 @@ secrets. No SSH, no open ports, no AWS access keys.
 | Security group | No inbound rules |
 | Access | AWS Systems Manager (Session Manager and Run Command) only |
 | IAM role | `trust-policy.json` + `role-policy.json` + `AmazonSSMManagedInstanceCore` |
-| S3 | Versioning on, public access blocked, default encryption; the role can read and write `brick-runner/*` but never delete |
-| SSM parameters | Under `/brick-runner/` (below) |
+| S3 | Versioning on, public access blocked, default encryption; the role can read and write `brick-runner/<project>/*` but never delete |
+| SSM parameters | Under `/brick-runner/<project>/` (below) |
 
 `bootstrap.sh` is the instance's user data. It installs the runner at a pinned
 commit, then waits for three things, and publishes its progress in
-`/brick-runner/status`:
+`/brick-runner/<project>/status`:
 
-1. **The GitHub App.** Create it from `../github-app-manifest.json` (the manifest flow), and put the one-time code from the redirect URL in `/brick-runner/manifest-code`. The instance exchanges it for the App's key itself; the key never leaves the machine except into `/brick-runner/app-key`.
+1. **The GitHub App.** Create it from `../github-app-manifest.json` (the manifest flow), and put the one-time code from the redirect URL in `/brick-runner/<project>/manifest-code`. The instance exchanges it for the App's key itself; the key never leaves the machine except into `/brick-runner/<project>/app-key`.
 2. **The App's installation** on the brick repository's owner.
-3. **The evidence deploy key.** The instance generates it and publishes the public half in `/brick-runner/pub/evidence`. Add it to the evidence repository with write access.
+3. **The evidence deploy key.** The instance generates it and publishes the public half in `/brick-runner/<project>/pub/evidence`. Add it to the evidence repository with write access.
 
 | Parameter | Type | Written by |
 | --- | --- | --- |

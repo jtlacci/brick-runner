@@ -1,5 +1,5 @@
 {
-  "name": "brick-runner-jtlacci",
+  "name": "brick-runner-@@PROJECT@@",
   "url": "https://github.com/jtlacci/brick-runner",
   "description": "Evaluates brick pull requests and posts the brick-runner status.",
   "public": false,

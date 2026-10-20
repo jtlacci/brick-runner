@@ -10,18 +10,19 @@
 # AWS access comes from the instance role. There are no AWS keys anywhere.
 #
 # Values filled in at launch:
-#   REGION, BUCKET, PREFIX, BRICK_REPO, EVIDENCE_REPO, ALLOW, RUNNER_REF, PARAMS
+#   REGION, BUCKET, PROJECT, BRICK_REPO, EVIDENCE_REPO, ALLOW, RUNNER_REF
 set -euo pipefail
 exec > >(tee -a /var/log/brick-runner-bootstrap.log) 2>&1
 
 REGION="@@REGION@@"
 BUCKET="@@BUCKET@@"
-PREFIX="brick-runner"
+PROJECT="@@PROJECT@@"               # one runner per project, for example chip
+PREFIX="brick-runner/$PROJECT"
 BRICK_REPO="@@BRICK_REPO@@"          # owner/name the service watches
 EVIDENCE_REPO="@@EVIDENCE_REPO@@"    # owner/name for the store's pointer files
 ALLOW="@@ALLOW@@"                    # GitHub logins allowed to /brick holdout and /brick promote
 RUNNER_REF="@@RUNNER_REF@@"          # the brick-runner commit to install
-PARAMS="/brick-runner"
+PARAMS="/brick-runner/$PROJECT"
 HOME_DIR=/var/lib/brick-runner
 VENV=/opt/brick-runner/venv
 
