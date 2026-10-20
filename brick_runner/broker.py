@@ -39,7 +39,7 @@ class CaseState:
     @classmethod
     def from_exchanges(cls, exchanges: list[dict[str, Any]]) -> "CaseState":
         table: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        for exchange in sorted(exchanges, key=lambda e: (e.get("time", ""), e.get("id", ""))):
+        for exchange in sorted(exchanges, key=lambda e: (e.get("time", ""), e.get("seq", 0), e.get("id", ""))):
             table.setdefault((exchange["name"], exchange["request_hash"]), []).append(exchange)
         return cls(table)
 

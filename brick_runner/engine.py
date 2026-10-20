@@ -139,9 +139,11 @@ class Runner:
                 records.append({"kind": "run", "brick": brick, "trace_id": trace, "run_id": trace,
                                 "parent_id": None, "input": item["input"], "input_hash": digest(item["input"]),
                                 "time": time, "seed": int(seed), "index": index})
-                for exchange in item.get("exchanges", []):
+                for seq, exchange in enumerate(item.get("exchanges", [])):
                     name = exchange["name"] if ":" in exchange["name"] else f"external:{exchange['name']}"
-                    records.append({"kind": "exchange", "name": name, "request": exchange["request"],
+                    # seq keeps two identical calls in one case apart: a record's ID is the hash of
+                    # its content, so without it the store would keep only one of them.
+                    records.append({"kind": "exchange", "seq": seq, "name": name, "request": exchange["request"],
                                     "request_hash": digest(exchange["request"]), "response": exchange["response"],
                                     "response_hash": digest(exchange["response"]), "trace_id": trace,
                                     "run_id": trace, "time": time})

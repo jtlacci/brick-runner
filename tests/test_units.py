@@ -62,6 +62,20 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(record["time"], "2026-01-01T00:00:00.000000+00:00")
 
 
+class DuplicateCallTests(unittest.TestCase):
+    def test_two_identical_calls_in_one_case_are_both_kept(self) -> None:
+        store = Store(Path(tempfile.mkdtemp(prefix="brick-dup-")))
+        self.addCleanup(shutil.rmtree, store.root, ignore_errors=True)
+        call = {"kind": "exchange", "name": "sibling:store", "request": {"op": "get", "key": "u"},
+                "request_hash": digest({"op": "get", "key": "u"}), "response": {"ok": True},
+                "response_hash": digest({"ok": True}), "trace_id": "t", "run_id": "t", "time": "2026-10-20T15:00:00+00:00"}
+        ids = store.add_records([{**call, "seq": 0}, {**call, "seq": 1}], source="synthetic")
+        self.assertEqual(len(set(ids)), 2)
+        state = CaseState.from_exchanges(store.exchanges("t"))
+        self.assertIsNotNone(state.take("sibling:store", {"op": "get", "key": "u"}))
+        self.assertIsNotNone(state.take("sibling:store", {"op": "get", "key": "u"}))
+
+
 class SplitTests(unittest.TestCase):
     def records(self, n: int, source: str = "live") -> list[dict]:
         return [{"id": digest(i), "time": f"2026-01-01T00:00:{i:02d}+00:00", "source": source} for i in range(n)]
