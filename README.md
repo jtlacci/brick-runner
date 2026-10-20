@@ -55,20 +55,20 @@ The runner machine **pulls** work from GitHub with `brick-runner serve`. GitHub 
 
 Every minute the service:
 
-1. fetches the brick repository into its own bare clone;
-2. for each open pull request into `main` from the same repository with a new head commit, plans the change by the policy on `main`, then runs the code loop (`submit` on development and validation) or the evaluation loop (`evaluation-change`). A change with both fails;
-3. posts a `brick-runner` commit status and one comment, updated on each push;
-4. runs `/brick holdout <brick>`, `/brick holdout <brick> rerun: <reason>` and `/brick promote <brick>` comments, only from the GitHub logins in `--allow`, never from bots;
+1. runs new `/brick holdout <brick>`, `/brick holdout <brick> rerun: <reason>` and `/brick promote <brick>` comments, only from the GitHub logins in `--allow`, never from bots, and never from a comment that was edited;
+2. fetches the brick repository into its own bare clone;
+3. for each open pull request into `main` from the same repository, evaluates it when its head or `main` changed: it plans the change by the policy on `main`, then runs the code loop (`submit` on development and validation) or the evaluation loop (`evaluation-change`). A change with both fails. Other pull requests (forks, other bases) get no status at all, so they cannot cover a failure;
+4. posts a `brick-runner` commit status and one comment, updated in place. Everything it posts is HTML-escaped and stripped of known secrets;
 5. backs up to S3 at most once every ten minutes.
 
-Make `brick-runner` a required status check on `main`.
+Run the service as its own **GitHub App**, make `brick-runner` a required check on `main` with that App as its expected source, and require branches to be up to date. [deploy/SETUP.md](deploy/SETUP.md) has the steps.
 
 ## Commands
 
 ```sh
 brick-runner --repo <brick repo> --home <runner state> <command>
 
-serve --github owner/name --allow login[,login]                # the polling service
+serve --github owner/name --allow login[,login] [--app-id ID --app-key PEM --installation-id ID]
 submit --brick B --commit C [--split development|validation]   # code loop
 evaluation-change --brick B --commit C                         # evaluation loop
 holdout --brick B [--rerun-reason R]                           # best validation trial, one holdout run

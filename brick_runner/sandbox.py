@@ -39,7 +39,9 @@ ws="$1"; shift
 mount --rbind "$ws" /mnt
 while [ "$1" != "--" ]; do
   case "$1" in
-    hide:*) p="${1#hide:}"; if [ -d "$p" ]; then mount -t tmpfs -o size=4m tmpfs "$p"; fi ;;
+    hide:*) p="${1#hide:}"
+            if [ -d "$p" ]; then mount -t tmpfs -o size=4m tmpfs "$p"
+            elif [ -e "$p" ]; then mount --bind /dev/null "$p"; fi ;;
   esac
   shift
 done

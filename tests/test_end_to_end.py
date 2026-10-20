@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -173,6 +174,26 @@ class Scenario(unittest.TestCase):
         self.assertEqual(engine.read_bytes(), before)
         self.assertFalse((Path.home() / ".gitconfig-planted").exists())
         self.assertFalse(marker.exists())
+
+    def test_09f_candidate_cannot_read_deployment_secrets(self) -> None:
+        secrets = self.tmp / "etc-brick-runner"
+        secrets.mkdir()
+        (secrets / "env").write_text("BRICK_RUNNER_GITHUB_TOKEN=ghs_must_not_leak_0123456789\n")
+        reader = (
+            "import sys\n\n"
+            "try:\n"
+            f"    print('LEAK', open({str(secrets / 'env')!r}).read(), file=sys.stderr)\n"
+            "except OSError as exc:\n"
+            "    print('BLOCKED', type(exc).__name__, file=sys.stderr)\n\n\n"
+            "def execute(inputs, ctx):\n"
+            "    return {'action': 'hold'}\n"
+        )
+        commit = self.branch("secret-reader", {"bricks/signal/src/logic.py": reader})
+        with mock.patch.dict(os.environ, {"BRICK_RUNNER_HIDE": str(secrets)}):
+            runner = Runner(self.root, self.tmp / "home")
+        view = runner.submit("signal", commit, "development")
+        self.assertNotIn("ghs_must_not_leak", view["log"])
+        self.assertIn("BLOCKED", view["log"])
 
     def test_09c_candidate_cannot_declare_its_own_cases_out_of_evidence(self) -> None:
         fake = fixture.SIGNAL_CORRECT.replace(

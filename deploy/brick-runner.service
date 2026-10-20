@@ -11,9 +11,10 @@ Wants=network-online.target
 Type=simple
 User=brick-runner
 Group=brick-runner
-# Holds BRICK_RUNNER_GITHUB_TOKEN and the AWS credentials (or use an instance role).
-# chmod 600, owned by brick-runner. Never commit it.
+# Root-owned (chmod 600). systemd reads it as root before it starts the service.
 EnvironmentFile=/etc/brick-runner/env
+# The GitHub App key, root-owned; the service reads it from $CREDENTIALS_DIRECTORY.
+LoadCredential=app-key:/etc/brick-runner/app-key.pem
 Environment=BRICK_RUNNER_HOME=/var/lib/brick-runner
 ExecStart=/opt/brick-runner/venv/bin/brick-runner serve \
     --github jtlacci/YOUR-BRICK-REPO \
@@ -23,8 +24,10 @@ ExecStart=/opt/brick-runner/venv/bin/brick-runner serve \
 Restart=on-failure
 RestartSec=30
 
-# The runner needs user namespaces for its sandbox. Do not add
-# PrivateUsers=, RestrictNamespaces= or NoNewPrivileges= here: they block it.
+# The runner needs user namespaces for its sandbox: do not add
+# PrivateUsers= or RestrictNamespaces=.
+NoNewPrivileges=yes
+ProtectSystem=full
 StateDirectory=brick-runner
 StateDirectoryMode=0700
 UMask=0077

@@ -29,7 +29,7 @@ import sys
 
 from . import backup
 from .engine import Runner, RunnerError
-from .github import GitHub, GitHubError
+from .github import AppAuth, GitHub, GitHubError
 from .gitrepo import GitError
 from .plan import make_plan
 from .policy import PolicyError
@@ -86,6 +86,11 @@ def main(argv: list[str] | None = None) -> int:
 
     serve = commands.add_parser("serve", help="poll GitHub, evaluate pull requests, post results")
     serve.add_argument("--github", required=True, help="owner/name of the brick repository")
+    serve.add_argument("--app-id", default=os.environ.get("BRICK_RUNNER_APP_ID"),
+                       help="GitHub App ID (recommended); else a token from BRICK_RUNNER_GITHUB_TOKEN")
+    serve.add_argument("--app-key", type=Path, default=os.environ.get("BRICK_RUNNER_APP_KEY"),
+                       help="the App's private key (PEM)")
+    serve.add_argument("--installation-id", default=os.environ.get("BRICK_RUNNER_INSTALLATION_ID"))
     serve.add_argument("--allow", default="", help="GitHub logins that may run /brick holdout and /brick promote")
     serve.add_argument("--branch", default="main", help="the protected branch; only pull requests into it run")
     serve.add_argument("--interval", type=float, default=60.0)
@@ -115,7 +120,12 @@ def dispatch(args: argparse.Namespace) -> dict:
     if args.command == "restore":
         return backup.restore(home, args.git)
     if args.command == "serve":
-        token = os.environ.get("BRICK_RUNNER_GITHUB_TOKEN") or _read_token(home)
+        if args.app_id:
+            if not (args.app_key and args.installation_id):
+                raise GitHubError("--app-id needs --app-key and --installation-id")
+            token = AppAuth(args.app_id, Path(args.app_key), args.installation_id)
+        else:
+            token = os.environ.get("BRICK_RUNNER_GITHUB_TOKEN") or _read_token(home)
         service = Service(GitHub(args.github, token), home, allowed={a for a in args.allow.split(",") if a},
                           branch=args.branch, sync_every=args.sync_every)
         if args.once:

@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import math
+import os
 from pathlib import Path
 import secrets
 import shutil
@@ -41,6 +42,16 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
+# Where the deployment keeps credentials. Every worker sees these as empty folders.
+DEFAULT_SECRET_PATHS = ("/etc/brick-runner", "/run/credentials", "~/.aws", "~/.ssh", "~/.config", "~/.git-credentials")
+
+
+def secret_paths() -> list[Path]:
+    """Folders hidden from every worker: the defaults, plus BRICK_RUNNER_HIDE (colon-separated)."""
+    extra = [p for p in os.environ.get("BRICK_RUNNER_HIDE", "").split(":") if p]
+    return [Path(p).expanduser() for p in (*DEFAULT_SECRET_PATHS, *extra)]
+
+
 class Runner:
     def __init__(self, repo: Path, home: Path, base_ref: str = "main") -> None:
         self.repo = Repo(Path(repo).resolve())
@@ -51,7 +62,7 @@ class Runner:
         self.base_ref = base_ref
         self.key = self._key()
         # Workers never see the runner's state or the repository.
-        self.sandbox = Sandbox(hide=[self.home, self.repo.path])
+        self.sandbox = Sandbox(hide=[self.home, self.repo.path, *secret_paths()])
 
     # ------------------------------------------------------------ basics
 

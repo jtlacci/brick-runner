@@ -26,8 +26,10 @@ class Plan:
 
 
 def changed_files(repo: Repo, base: str, head: str) -> list[str]:
-    out = str(repo.git("diff", "--name-only", "--no-renames", f"{base}...{head}"))
-    return sorted({line for line in out.splitlines() if line})
+    # -z: names exactly as stored, never C-quoted, so a non-ASCII name is classified like any other.
+    # --no-renames: a rename is a deletion and an addition, and both paths count.
+    out = str(repo.git("diff", "--name-only", "-z", "--no-renames", f"{base}...{head}"))
+    return sorted({name for name in out.split("\0") if name})
 
 
 def make_plan(repo: Repo, base: str, head: str) -> Plan:
