@@ -48,9 +48,20 @@ done
 shift
 # Everything except the worker's own tree becomes read-only: the runner's
 # source, the Python environment, /root, /etc, /dev/shm (now a private tmpfs).
-for m in $(awk '{print $2}' /proc/self/mounts | sort -u); do
+# In a user namespace the kernel locks nosuid, nodev, noexec and the atime
+# flags of inherited mounts, so a remount must repeat them (snap mounts, /run).
+# The last line for a mount point is the mount on top, the one a remount changes.
+# (The loop runs in a subshell of the pipe; the mounts are the same namespace,
+# and set -e stops the wrapper when the loop exits 97.)
+awk '{o[$2]=$4} END {for (m in o) print m, o[m]}' /proc/self/mounts | while read -r m opts; do
   case "$m" in /mnt|/mnt/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/pts) continue ;; esac
-  mount -o remount,bind,ro "$m" 2>/dev/null || { echo "sandbox: cannot make $m read-only" >&2; exit 97; }
+  # A mount that is already read-only stays so: the kernel locks that flag too.
+  case ",$opts," in *,ro,*) continue ;; esac
+  keep=""
+  for o in $(echo "$opts" | tr , ' '); do
+    case "$o" in nosuid|nodev|noexec|noatime|nodiratime|relatime|strictatime) keep="$keep,$o" ;; esac
+  done
+  mount -o "remount,bind,ro$keep" "$m" 2>/dev/null || { echo "sandbox: cannot make $m read-only" >&2; exit 97; }
 done
 cd /mnt
 exec "$@"
