@@ -204,15 +204,15 @@ class Scenario(unittest.TestCase):
                "FAKE_PRICES": json.dumps({"BTC": 50.0, "ETH": 20.0, "SOL": 80.0})}
         fixture.git(self.root, "checkout", "-q", self.correct)
         script = ("from bricks.signal import run\n"
-                  "for i in range(60):\n"
-                  "    run({'symbol': ['BTC', 'ETH', 'SOL'][i % 3], 'threshold': float(i * 2)})\n")
+                  "for i in range(150):\n"
+                  "    run({'symbol': ['BTC', 'ETH', 'SOL'][i % 3], 'threshold': float(i % 100)})\n")
         subprocess.run([sys.executable, "-c", script], cwd=self.root, env=env, check=True)
         fixture.git(self.root, "checkout", "-q", "main")
         self.assertGreater(ingest_spool(self.runner.store, spool), 0)
         runs = [r["id"] for r in self.runner.store.query(kind="run", brick="signal", source="live")]
-        self.assertEqual(len(runs), 60)
+        self.assertEqual(len(runs), 150)
         nested = list(self.runner.store.query(kind="run", brick="market_data", source="live"))
-        self.assertEqual(len(nested), 60)
+        self.assertEqual(len(nested), 150)
         self.assertTrue(all("output_hash" in r and "output_ref" in r for r in nested))  # nondeterministic: kept
         signal_run = self.runner.store.record(runs[0])
         self.assertNotIn("output", signal_run)  # deterministic: hash only
