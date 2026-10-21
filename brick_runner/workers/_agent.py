@@ -68,9 +68,12 @@ class Agent:
 
         page.on("filechooser", picker)
         actions: list[str] = []
+        notes: list[str] = []
         try:
             reply = self._ask({"session": session, "task": task, "results": [{"image": self._shot(page)}]})
             while "actions" in reply:
+                if reply.get("note"):
+                    notes = (notes + [str(reply["note"])[:300]])[-8:]
                 results = []
                 failed = False
                 for action in reply["actions"]:
@@ -96,11 +99,11 @@ class Agent:
             page.remove_listener("filechooser", picker)
         if "error" in reply:
             return {"status": "error", "text": str(reply["error"])[:500], "steps": len(actions),
-                    "actions": actions[:200], "pickers": state["pickers"]}
+                    "actions": actions[:200], "pickers": state["pickers"], "notes": notes}
         text = str(reply.get("text", ""))
         word = text.split(None, 1)[0].strip(".:,").upper() if text.strip() else ""
         return {"status": "done" if word == "DONE" else "failed", "text": text[:500], "steps": len(actions),
-                "actions": actions[:200], "pickers": state["pickers"]}
+                "actions": actions[:200], "pickers": state["pickers"], "notes": notes}
 
     @staticmethod
     def _shot(page, clip: dict[str, float] | None = None) -> str:

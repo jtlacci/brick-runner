@@ -663,9 +663,11 @@ class Runner:
                                 unbuildable[strength] += 1   # neither caught nor missed
                                 continue
                             raw[strength].append(result.get("terms", {}).get(policy.metric))
-                            mutants += 1
                             seen = result.get("per_case") or {}
-                            for case, value in base_cases.items():
+                            mutants += 1 if seen else 0
+                            # A run with no case scores (a fatal error) catches the mutant as a whole,
+                            # but says nothing about which cases would catch it.
+                            for case, value in (base_cases.items() if seen else ()):
                                 # Lower than in the baseline, or no score at all (it crashed): caught.
                                 got = seen.get(case)
                                 if got is None or got < value - tolerance:

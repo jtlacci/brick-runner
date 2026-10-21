@@ -599,6 +599,18 @@ class WebScenario(unittest.TestCase):
         finally:
             server.shutdown()
 
+    @unittest.skipUnless(HAS_CHROME, "Google Chrome and Xvfb are needed")
+    def test_17b_parallel_headed_chrome_workers_start(self) -> None:
+        server, env = self._agent_env()
+        try:
+            commit = self.branch("agent-parallel-headed", {**AGENT_APP, "bricks/web/app/src/main.js": AGENT_APP["bricks/web/app/src/main.js"] + "// headed\n"})
+            with mock.patch.dict(os.environ, {**env, "BRICK_RUNNER_WEB_WORKERS": "3", "BRICK_RUNNER_BROWSER": "chrome"}):
+                result = self.runner.evaluate("web", "development", [], base=self.runner.repo.commit(commit), cache=False)
+            # Three Xvfb servers start at the same moment, one in each sandbox.
+            self.assertTrue(result["passed"], result.get("reasons"))
+        finally:
+            server.shutdown()
+
     def test_18_sessions_from_two_workers_do_not_mix(self) -> None:
         from brick_runner.agent import Agents
 
@@ -638,7 +650,7 @@ class WebScenario(unittest.TestCase):
                 clock.sleep(0.5)
                 ps = sp.run(["ps", "-eo", "pid,ppid,args"], capture_output=True, text=True).stdout
                 mine = [line for line in ps.splitlines()
-                        if len(line.split()) > 3 and line.split()[2].endswith("Xvfb") and "-displayfd" in line]
+                        if len(line.split()) > 3 and line.split()[2].endswith("Xvfb") and "-screen" in line]
             self.assertTrue(mine, "Xvfb started")
             pids = [line.split()[0] for line in mine]
             worker.stop()

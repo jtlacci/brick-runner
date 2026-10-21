@@ -172,8 +172,11 @@ class Sandbox:
 
     def start(self, script: str, workspace: Path) -> "Process":
         command, _ = self.command(script, workspace)
+        env = self.env()
+        # A worker that starts its own tools (Xvfb) needs to know if it has a /tmp of its own.
+        env["BRICK_RUNNER_SANDBOXED"] = "0" if self.unsandboxed else "1"
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   text=True, cwd=workspace, env=self.env(), bufsize=1)
+                                   text=True, cwd=workspace, env=env, bufsize=1)
         return Process(process)
 
 

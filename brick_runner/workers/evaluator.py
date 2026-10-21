@@ -97,38 +97,36 @@ def serve(root: Path, headers: dict[str, str] | None = None):
 def screen(xvfb: str) -> object:
     """Start Xvfb for a headed browser and point DISPLAY at it. The guard is not armed yet.
 
-    Xvfb picks a free display itself (-displayfd) and gets SIGKILL when this
-    worker dies (PR_SET_PDEATHSIG), so a killed evaluation leaves no X server.
+    In the sandbox /tmp and the network are the worker's own, so a fixed display
+    number cannot meet another worker's X server. (Unsandboxed, for development,
+    the number comes from the process ID.) Xvfb gets SIGKILL when this worker dies
+    (PR_SET_PDEATHSIG), so a killed evaluation leaves no X server.
     """
     import ctypes
     import os
-    import select
     import signal
     import subprocess
+    import time
 
     libc = ctypes.CDLL(None, use_errno=True)
 
     def die_with_parent() -> None:
         libc.prctl(1, signal.SIGKILL)   # PR_SET_PDEATHSIG
 
-    read_end, write_end = os.pipe()
+    number = 99 if os.environ.get("BRICK_RUNNER_SANDBOXED", "1") == "1" else 100 + os.getpid() % 5000
     log_path = Path(os.environ.get("TMPDIR") or ".") / f"xvfb-{os.getpid()}.log"
-    log = open(log_path, "wb")
-    try:
-        process = subprocess.Popen([xvfb, "-displayfd", str(write_end), "-screen", "0", SCREEN, "-nolisten", "tcp"],
+    with open(log_path, "wb") as log:
+        process = subprocess.Popen([xvfb, f":{number}", "-screen", "0", SCREEN, "-nolisten", "tcp"],
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log,
-                                   pass_fds=(write_end,), preexec_fn=die_with_parent)
-    finally:
-        os.close(write_end)
-        log.close()
-    ready, _, _ = select.select([read_end], [], [], 15)
-    number = os.read(read_end, 32).decode().strip() if ready else ""
-    os.close(read_end)
-    if not number.isdigit():
-        process.kill()
-        process.wait()
-        text = log_path.read_bytes()[-500:].decode(errors="replace")
-        raise RuntimeError("Xvfb did not start: " + text)
+                                   preexec_fn=die_with_parent)
+    socket = Path(f"/tmp/.X11-unix/X{number}")
+    deadline = time.monotonic() + 30
+    while not socket.exists():
+        if process.poll() is not None or time.monotonic() > deadline:
+            process.kill()   # first, so the log is complete and nothing blocks
+            process.wait()
+            raise RuntimeError("Xvfb did not start: " + log_path.read_bytes()[-500:].decode(errors="replace"))
+        time.sleep(0.05)
     os.environ["DISPLAY"] = f":{number}"
     return process
 

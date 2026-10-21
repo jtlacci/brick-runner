@@ -141,10 +141,11 @@ class Agents:
         session["messages"].append({"role": "assistant", "content": content})
         actions = [{"id": str(b.get("id")), "name": str(b.get("name")), "input": b.get("input") or {}}
                    for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+        text = "".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text").strip()
         if actions:
             session["pending"] = {a["id"] for a in actions}
-            return {"actions": actions}
-        text = "".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text").strip()
+            # What the model said with its actions: why a long run went on is then in the result.
+            return {"actions": actions, "note": text[:300]} if text else {"actions": actions}
         self._close(session, "")
         return {"done": True, "text": text[:MAX_TEXT]}
 
