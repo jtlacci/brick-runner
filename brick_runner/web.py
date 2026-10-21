@@ -28,6 +28,7 @@ with real input events, focus and native dialogs.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -126,8 +127,8 @@ def read_headers(app: Path) -> dict[str, str]:
     for name, value in headers.items():
         if not isinstance(name, str) or name.lower() not in allowed:
             raise BuildError(f"{APP}/{HEADERS_FILE}: {name!r} is not an allowed header ({', '.join(ALLOWED_HEADERS)})")
-        if not isinstance(value, str) or len(value) > 4000 or any(c in value for c in "\r\n"):
-            raise BuildError(f"{APP}/{HEADERS_FILE}: the value of {name} must be one line of text")
+        if not isinstance(value, str) or len(value) > 4000 or not all(32 <= ord(c) < 127 for c in value):
+            raise BuildError(f"{APP}/{HEADERS_FILE}: the value of {name} must be one line of printable ASCII")
         clean[allowed[name.lower()]] = value
     return clean
 
@@ -162,10 +163,18 @@ def toolchain() -> dict[str, str]:
         playwright = metadata.version("playwright")
     except metadata.PackageNotFoundError:
         playwright = "missing"
-    browser = browser_settings()
-    used = (version([str(browser["executable"]), "--version"]) + " headed") if browser["name"] == "chrome" else "chromium headless"
+    try:
+        browser = browser_settings()
+        used = (version([str(browser["executable"]), "--version"]) + " headed") if browser["name"] == "chrome" \
+            else "chromium headless"
+    except BuildError as exc:
+        used = f"unavailable: {exc}"   # the build step then fails with this reason
+    # The runner's own browser and agent code: a change to it is a new evaluation.
+    here = Path(__file__).resolve().parent
+    harness = hashlib.sha256(b"".join((here / name).read_bytes() for name in
+                                      ("agent.py", "workers/_agent.py", "workers/evaluator.py"))).hexdigest()[:16]
     return {"node": version(["node", "--version"]), "npm": version(["npm", "--version"]),
-            "playwright": playwright, "browser": used,
+            "playwright": playwright, "browser": used, "harness": harness,
             "browsers": ",".join(sorted(p.name for p in Path(browsers).iterdir())) if browsers and Path(browsers).is_dir() else ""}
 
 

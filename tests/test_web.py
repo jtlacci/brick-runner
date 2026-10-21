@@ -191,8 +191,9 @@ AGENT_APP = {
 
 
 class FakeAgent(http.server.BaseHTTPRequestHandler):
-    """Clicks (60, 30), then reports DONE."""
+    """Clicks (60, 30), then reports DONE. ``mode`` "down" answers 503; "batch" sends a bad action first."""
     calls: list[dict] = []
+    mode = "ok"
 
     def log_message(self, *_args) -> None:
         pass
@@ -200,9 +201,18 @@ class FakeAgent(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         FakeAgent.calls.append(body)
+        if FakeAgent.mode == "down":
+            self.send_response(503)
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
         last = body["messages"][-1]["content"]
         if any(b.get("type") == "tool_result" for b in last):
             content = [{"type": "text", "text": "DONE The title says Clicked."}]
+        elif FakeAgent.mode == "batch":
+            content = [{"type": "tool_use", "id": "toolu_0", "name": "teleport", "toolset_name": "computer", "input": {}},
+                       {"type": "tool_use", "id": "toolu_1", "name": "left_click", "toolset_name": "computer",
+                        "input": {"coordinate": [60, 30]}}]
         else:
             content = [{"type": "tool_use", "id": "toolu_1", "name": "left_click", "toolset_name": "computer",
                         "input": {"coordinate": [60, 30]}}]
@@ -241,10 +251,47 @@ class AgentUnitTests(unittest.TestCase):
             def post(self, body):
                 return {"content": [{"type": "tool_use", "id": "a1", "name": "screenshot", "input": {}}]}
 
-        agents = Agents(Judge(), "m")
+        agents = Agents(Judge(), "claude-sonnet-5-5")
         self.assertIn("actions", agents.step({"session": "s", "task": "do it", "results": [{"image": "x"}]}))
         self.assertIn("error", agents.step({"session": "s", "results": [{"id": "other", "text": "OK"}]}))
-        self.assertIn("error", agents.step({"session": "new"}))   # no task
+        # The session ended with that error; it cannot be reopened.
+        self.assertEqual(agents.step({"session": "s", "results": [{"id": "a1", "text": "OK"}]}),
+                         {"error": "this session has ended"})
+        self.assertIn("error", agents.step({"session": "new", "results": [{"image": "x"}]}))   # no task
+        self.assertIn("error", agents.step({"session": "bad", "task": "t", "results": "x"}))
+        self.assertIn("error", agents.step({"session": "big", "task": "t", "results": 5000 * [{"text": "x"}]}))
+
+    def test_models_are_allowed_by_name(self) -> None:
+        from brick_runner.agent import AgentError, Agents
+        with self.assertRaises(AgentError):
+            Agents(object(), "some-other-model")
+
+    def test_the_evaluation_wide_limit_is_fatal(self) -> None:
+        from brick_runner import agent as module
+
+        class Judge:
+            def post(self, body):
+                return {"content": [{"type": "tool_use", "id": "a1", "name": "screenshot", "input": {}}]}
+
+        agents = module.Agents(Judge(), "claude-sonnet-5-5")
+        agents.calls = module.MAX_CALLS_PER_EVALUATION
+        with self.assertRaises(module.AgentError):
+            agents.step({"session": "s", "task": "do it", "results": [{"image": "x"}]})
+
+    def test_header_values_are_printable_ascii(self) -> None:
+        folder = Path(tempfile.mkdtemp(prefix="brick-headers-"))
+        try:
+            for value in ("a\x00b", "a\x0bb", "caf\u00e9", "a\nb"):
+                (folder / "headers.json").write_text(json.dumps({"Referrer-Policy": value}))
+                with self.assertRaises(web.BuildError):
+                    web.read_headers(folder)
+            (folder / "headers.json").write_text(json.dumps(["not", "an", "object"]))
+            with self.assertRaises(web.BuildError):
+                web.read_headers(folder)
+            (folder / "headers.json").write_text(json.dumps({"referrer-policy": "same-origin"}))
+            self.assertEqual(web.read_headers(folder), {"Referrer-Policy": "same-origin"})
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
 
 
 def add_web_brick(root: Path) -> None:
@@ -425,7 +472,7 @@ class WebScenario(unittest.TestCase):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeAgent)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         env = {"BRICK_RUNNER_JUDGE_URL": f"http://127.0.0.1:{server.server_address[1]}/v1/messages",
-               "BRICK_RUNNER_JUDGE_KEY": str(self.tmp / "judge-key")}
+               "BRICK_RUNNER_JUDGE_KEY": str(self.tmp / "judge-key"), "BRICK_RUNNER_AGENT_MODELS": "claude-test-agent"}
         try:
             commit = self.branch("agent", AGENT_APP)
             base = self.runner.repo.commit(commit)
@@ -435,7 +482,7 @@ class WebScenario(unittest.TestCase):
             self.assertGreaterEqual(result["counts"]["agent_calls"], 2)
             first = FakeAgent.calls[0]
             self.assertEqual(first["model"], "claude-test-agent")
-            self.assertEqual(first["tools"], [{"type": "computer_toolset_20260801"}])
+            self.assertEqual(first["tools"], [{"type": "computer_toolset_20260801", "configs": {"zoom": {"enabled": False}}}])
             self.assertEqual(first["messages"][0]["content"][1]["type"], "image")
             answer = FakeAgent.calls[1]["messages"][-1]["content"][0]
             self.assertEqual(answer["type"], "tool_result")
@@ -450,6 +497,89 @@ class WebScenario(unittest.TestCase):
             self.assertNotIn("clicked", [g["term"] for g in mutant["gates"]])
         finally:
             server.shutdown()
+
+    def _agent_env(self):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeAgent)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        env = {"BRICK_RUNNER_JUDGE_URL": f"http://127.0.0.1:{server.server_address[1]}/v1/messages",
+               "BRICK_RUNNER_JUDGE_KEY": str(self.tmp / "judge-key"), "BRICK_RUNNER_AGENT_MODELS": "claude-test-agent"}
+        return server, env
+
+    def test_14_an_api_outage_is_not_recorded(self) -> None:
+        from brick_runner.engine import RunnerError
+        server, env = self._agent_env()
+        FakeAgent.mode = "down"
+        try:
+            commit = self.branch("agent-down", {**AGENT_APP, "bricks/web/app/src/main.js": AGENT_APP["bricks/web/app/src/main.js"] + "// down\n"})
+            base = self.runner.repo.commit(commit)
+            with mock.patch.dict(os.environ, env), mock.patch("brick_runner.judge.time.sleep"):
+                with self.assertRaises(RunnerError):
+                    self.runner.evaluate("web", "development", [], base=base)
+            FakeAgent.mode = "ok"
+            with mock.patch.dict(os.environ, env):
+                again = self.runner.evaluate("web", "development", [], base=base)
+            self.assertFalse(again.get("cached"), "the outage left no cached result")
+            self.assertTrue(again["passed"], again)
+        finally:
+            FakeAgent.mode = "ok"
+            server.shutdown()
+
+    def test_15_after_a_failed_action_the_rest_of_the_turn_is_not_run(self) -> None:
+        server, env = self._agent_env()
+        FakeAgent.mode = "batch"
+        FakeAgent.calls.clear()
+        try:
+            commit = self.branch("agent-batch", {**AGENT_APP, "bricks/web/app/src/main.js": AGENT_APP["bricks/web/app/src/main.js"] + "// batch\n"})
+            with mock.patch.dict(os.environ, env):
+                result = self.runner.evaluate("web", "development", [], base=self.runner.repo.commit(commit), cache=False)
+            # The click after the bad action never ran, so the title never changed.
+            self.assertFalse(result["passed"])
+            answers = next(c["messages"][-1]["content"] for c in FakeAgent.calls
+                           if any(b.get("type") == "tool_result" for b in c["messages"][-1]["content"]))
+            self.assertTrue(answers[0]["is_error"])
+            self.assertTrue(answers[1]["is_error"])
+            self.assertIn("Not executed", answers[1]["content"][0]["text"])
+        finally:
+            FakeAgent.mode = "ok"
+            server.shutdown()
+
+    @unittest.skipUnless(HAS_CHROME, "Google Chrome and Xvfb are needed")
+    def test_16_a_killed_worker_leaves_no_x_server(self) -> None:
+        import subprocess as sp
+        import time as clock
+        from brick_runner.sandbox import Sandbox
+        work = Path(tempfile.mkdtemp(prefix="brick-kill-"))
+        try:
+            (work / ".web-build").mkdir()
+            (work / ".web-build/index.html").write_text("<h1>x</h1>")
+            fixture.write(work / "bricks/web", "evaluation/evaluate.py", '''
+                import time
+
+
+                def observe(input, browser, base_url):
+                    time.sleep(600)
+            ''')
+            fixture.write(work / "bricks/web", "contract.py", "KIND = 'web'\n")
+            worker = Sandbox([]).start("evaluator.py", work)
+            worker.send({"brick": "web", "command": "observe", "inputs": [{}], "agent": False,
+                         "browser": web.browser_settings() if os.environ.get("BRICK_RUNNER_BROWSER") == "chrome"
+                         else {"name": "chrome", "headed": True, "executable": str(web.CHROME), "xvfb": shutil.which("Xvfb")}})
+            deadline = clock.monotonic() + 30
+            mine = []
+            while clock.monotonic() < deadline and not mine:
+                clock.sleep(0.5)
+                ps = sp.run(["ps", "-eo", "pid,ppid,args"], capture_output=True, text=True).stdout
+                mine = [line for line in ps.splitlines()
+                        if len(line.split()) > 3 and line.split()[2].endswith("Xvfb") and "-displayfd" in line]
+            self.assertTrue(mine, "Xvfb started")
+            pids = [line.split()[0] for line in mine]
+            worker.stop()
+            clock.sleep(1.0)
+            ps = sp.run(["ps", "-eo", "pid,args"], capture_output=True, text=True).stdout
+            alive = [line for line in ps.splitlines() if line.split()[0] in pids and line.split()[1].endswith("Xvfb")]
+            self.assertEqual(alive, [], "Xvfb died with the worker")
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == "__main__":

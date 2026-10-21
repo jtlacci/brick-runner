@@ -42,7 +42,6 @@ from _common import arm, finish, start  # noqa: E402
 BUILD_FOLDER = ".web-build"
 HEADERS_COPY = ".web-headers.json"
 SCREEN = "1920x1200x24"
-DISPLAY = 99
 
 
 def load(workspace: Path, brick: str):
@@ -95,21 +94,42 @@ def serve(root: Path, headers: dict[str, str] | None = None):
     return server
 
 
-def screen() -> object:
-    """Start Xvfb for a headed browser; DISPLAY points at it. The guard is not armed yet."""
+def screen(xvfb: str) -> object:
+    """Start Xvfb for a headed browser and point DISPLAY at it. The guard is not armed yet.
+
+    Xvfb picks a free display itself (-displayfd) and gets SIGKILL when this
+    worker dies (PR_SET_PDEATHSIG), so a killed evaluation leaves no X server.
+    """
+    import ctypes
     import os
+    import select
+    import signal
     import subprocess
-    import time
-    xvfb = os.environ.get("BRICK_RUNNER_XVFB") or "Xvfb"
-    process = subprocess.Popen([xvfb, f":{DISPLAY}", "-screen", "0", SCREEN, "-nolisten", "tcp"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    socket = Path(f"/tmp/.X11-unix/X{DISPLAY}")
-    deadline = time.monotonic() + 15
-    while not socket.exists():
-        if process.poll() is not None or time.monotonic() > deadline:
-            raise RuntimeError("Xvfb did not start: " + (process.stderr.read() or b"").decode(errors="replace")[-500:])
-        time.sleep(0.05)
-    os.environ["DISPLAY"] = f":{DISPLAY}"
+
+    libc = ctypes.CDLL(None, use_errno=True)
+
+    def die_with_parent() -> None:
+        libc.prctl(1, signal.SIGKILL)   # PR_SET_PDEATHSIG
+
+    read_end, write_end = os.pipe()
+    log_path = Path(os.environ.get("TMPDIR") or ".") / f"xvfb-{os.getpid()}.log"
+    log = open(log_path, "wb")
+    try:
+        process = subprocess.Popen([xvfb, "-displayfd", str(write_end), "-screen", "0", SCREEN, "-nolisten", "tcp"],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log,
+                                   pass_fds=(write_end,), preexec_fn=die_with_parent)
+    finally:
+        os.close(write_end)
+        log.close()
+    ready, _, _ = select.select([read_end], [], [], 15)
+    number = os.read(read_end, 32).decode().strip() if ready else ""
+    os.close(read_end)
+    if not number.isdigit():
+        process.kill()
+        process.wait()
+        text = log_path.read_bytes()[-500:].decode(errors="replace")
+        raise RuntimeError("Xvfb did not start: " + text)
+    os.environ["DISPLAY"] = f":{number}"
     return process
 
 
@@ -136,21 +156,21 @@ def observe(stream, workspace: Path, payload: dict) -> None:
     headers = json.loads(headers_file.read_text()) if headers_file.is_file() else {}
     settings = payload.get("browser") or {"name": "chromium"}
     from playwright.sync_api import sync_playwright
-    xvfb = None
-    try:
-        xvfb = screen() if settings.get("headed") else None
-    except Exception as exc:
-        end({"fatal": str(exc)})
-        return
-    server = serve(root, headers)
-    base_url = f"http://127.0.0.1:{server.server_address[1]}"
-    driver = sync_playwright().start()
-    browser = launch(driver, settings)
     from _agent import Agent, channel
-    # The guard is armed before any evaluation code runs, its import included.
-    arm()
+    xvfb = server = driver = browser = None
     observations = []
     try:
+        try:
+            xvfb = screen(str(settings.get("xvfb") or "Xvfb")) if settings.get("headed") else None
+            server = serve(root, headers)
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            driver = sync_playwright().start()
+            browser = launch(driver, settings)
+        except Exception as exc:
+            end({"fatal": f"the browser did not start: {type(exc).__name__}: {str(exc)[:500]}"})
+            return
+        # The guard is armed before any evaluation code runs, its import included.
+        arm()
         try:
             module = load(workspace, payload["brick"])
         except Exception:
@@ -173,11 +193,11 @@ def observe(stream, workspace: Path, payload: dict) -> None:
             except Exception:
                 observations.append(failure())
     finally:
-        browser.close()
-        driver.stop()
-        server.shutdown()
-        if xvfb is not None:
-            xvfb.kill()
+        for stop in (lambda: browser.close(), lambda: driver.stop(), lambda: server.shutdown(), lambda: xvfb.kill()):
+            try:
+                stop()
+            except Exception:
+                pass
     end({"observations": observations})
 
 

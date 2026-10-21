@@ -35,7 +35,9 @@ DEFECT_STRENGTHS = (1, 2, 4)
 DEFECT_SEEDS = (0, 1, 2, 3)
 OPERATORS = {">=": lambda a, b: a >= b, "<=": lambda a, b: a <= b, ">": lambda a, b: a > b, "<": lambda a, b: a < b}
 LOG_LIMIT = 4000
-OBSERVE_TIMEOUT = 3 * 3600   # a web evaluation with agent sessions can take long
+OBSERVE_TIMEOUT = 600          # observe with no agent, as for every other worker
+AGENT_STEP_TIME = 90           # each agent step gives the worker this much more time ...
+OBSERVE_TIMEOUT_MAX = 3 * 3600  # ... up to this
 NO_AGENT_KINDS = ("defect-baseline", "defect-mutant")   # the defect check runs no agent case
 
 
@@ -256,8 +258,10 @@ class Runner:
             kept.append(record)
         if skipped_agent:
             counts["agent_cases_skipped"] = skipped_agent
-        agents = Agents(self.judge, declared_agent["model"]) if declared_agent and agent else None
+        agents = None
         try:
+            if declared_agent and agent:
+                agents = Agents(self.judge, declared_agent["model"])
             if self.kind(base, brick) == "web":
                 results, log = self._run_web(brick, ws, cases, agents)
             else:
@@ -272,6 +276,9 @@ class Runner:
                     "reasons": [f"the candidate worker failed: {exc}"], "counterexamples": examples,
                     "log": exc.log[-LOG_LIMIT:]}
         except AgentError as exc:
+            if exc.transient:
+                # The API failed, not the candidate: no result is recorded, so a retry runs it again.
+                raise RunnerError(f"the computer use agent's API failed; try again: {exc}") from None
             counts.update(agents.usage() if agents else {})
             return {"passed": False, "terms": {}, "gates": [], "counts": counts, "fatal": str(exc),
                     "reasons": [f"the computer use agent failed: {exc}"], "counterexamples": examples,
@@ -296,6 +303,8 @@ class Runner:
             try:
                 self._judge(ws, items, counts, examples)
             except JudgeError as exc:
+                if exc.transient:
+                    raise RunnerError(f"the judge API failed; try again: {exc}") from None
                 return {"passed": False, "terms": {}, "gates": [], "counts": counts, "fatal": str(exc),
                         "reasons": [f"the model judge failed: {exc}"], "counterexamples": examples[:50],
                         "log": log[-LOG_LIMIT:]}
@@ -355,7 +364,8 @@ class Runner:
         """The observe command, over a line channel: the worker may ask for agent steps before its result."""
         workspace.verify_evaluation(self.repo, ws)
         worker = self.sandbox.start("evaluator.py", ws.evaluation)
-        deadline = time.monotonic() + OBSERVE_TIMEOUT
+        started = time.monotonic()
+        deadline = started + OBSERVE_TIMEOUT
         try:
             worker.send({"brick": ws.target, "command": "observe", "inputs": inputs,
                          "browser": web.browser_settings(), "agent": agents is not None})
@@ -364,9 +374,15 @@ class Runner:
                 if message.get("op") == "result":
                     if "fatal" in message:
                         raise SandboxError(f"evaluator.py failed: {message['fatal']}", worker.log_text())
-                    return message["observations"], worker.log_text()
+                    observations = message.get("observations")
+                    if not isinstance(observations, list) or len(observations) != len(inputs) \
+                            or not all(isinstance(o, dict) for o in observations):
+                        raise SandboxError("evaluator.py gave no observation for each case", worker.log_text())
+                    return observations, worker.log_text()
                 if message.get("op") == "agent":
                     reply = agents.step(message) if agents else {"error": "this evaluation runs no agent"}
+                    if agents:
+                        deadline = min(deadline + AGENT_STEP_TIME, started + OBSERVE_TIMEOUT_MAX)
                     worker.send(reply)
                 else:
                     worker.send({"error": f"unknown request {message.get('op')!r}"})

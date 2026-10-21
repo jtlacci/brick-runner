@@ -67,7 +67,7 @@ done
 # A new, empty /tmp that the worker can write: some tools have no other place
 # (Xvfb puts its lock file and socket there). It is private to this worker and
 # shows nothing of the host's /tmp.
-mount -t tmpfs -o size=16m,mode=1777,nosuid,nodev tmpfs /tmp
+mount -t tmpfs -o size=16m,mode=1777,nosuid,nodev,noexec tmpfs /tmp
 # A new network namespace has only a loopback interface, and it is down.
 # Builds and browser evaluations serve pages on 127.0.0.1, so start it.
 # Without iproute2, set IFF_UP with the SIOCGIFFLAGS and SIOCSIFFLAGS ioctls.

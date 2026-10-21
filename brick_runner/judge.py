@@ -15,6 +15,7 @@ credential). BRICK_RUNNER_JUDGE_URL overrides the endpoint (for tests).
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 from pathlib import Path
@@ -35,7 +36,11 @@ ATTEMPTS = 4
 
 
 class JudgeError(RuntimeError):
-    pass
+    """``transient``: the API failed (overload, network), not the evaluation; try again later."""
+
+    def __init__(self, message: str, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
 
 
 def normalise(request: dict[str, Any]) -> dict[str, Any]:
@@ -101,14 +106,18 @@ class Judge:
         for attempt in range(ATTEMPTS):
             try:
                 with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers), timeout=180) as r:
-                    return json.load(r)
+                    answer = json.load(r)
+                if not isinstance(answer, dict):
+                    raise ValueError("the answer is not an object")
+                return answer
             except urllib.error.HTTPError as exc:
-                if exc.code not in (429, 500, 502, 503, 529) or attempt == ATTEMPTS - 1:
+                retry = exc.code in (429, 500, 502, 503, 529)
+                if not retry or attempt == ATTEMPTS - 1:
                     # The key is in a header, never in the URL or the body, so the message is safe.
-                    raise JudgeError(f"the judge API answered HTTP {exc.code}") from None
-            except (urllib.error.URLError, TimeoutError) as exc:
+                    raise JudgeError(f"the judge API answered HTTP {exc.code}", transient=retry) from None
+            except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException, ValueError) as exc:
                 if attempt == ATTEMPTS - 1:
-                    raise JudgeError(f"the judge API cannot be reached: {exc.__class__.__name__}") from None
+                    raise JudgeError(f"the judge API cannot be reached: {exc.__class__.__name__}", transient=True) from None
             time.sleep(delay)
             delay *= 2
-        raise JudgeError("the judge API failed")
+        raise JudgeError("the judge API failed", transient=True)

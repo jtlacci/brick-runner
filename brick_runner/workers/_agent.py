@@ -15,6 +15,9 @@ import json
 from typing import Any
 
 SETTLE_MS = 300
+MAX_SIDE = 2576                 # the API refuses a larger screenshot
+MAX_PIXELS = 3_750_000
+NOT_RUN = "Not executed: an earlier computer action in this turn failed."
 MAX_WAIT_S = 10
 KEYS = {"ctrl": "Control", "control": "Control", "alt": "Alt", "shift": "Shift", "super": "Meta", "cmd": "Meta",
         "meta": "Meta", "win": "Meta", "return": "Enter", "enter": "Enter", "kp_enter": "Enter",
@@ -69,13 +72,20 @@ class Agent:
             reply = self._ask({"session": session, "task": task, "results": [{"image": self._shot(page)}]})
             while "actions" in reply:
                 results = []
+                failed = False
                 for action in reply["actions"]:
+                    if failed:
+                        # After a failed action the rest of the turn is not done: a click that missed,
+                        # then typing, would type into the wrong place.
+                        results.append({"id": action.get("id"), "text": NOT_RUN, "is_error": True})
+                        continue
                     actions.append(action.get("name", "?"))
                     before = state["pickers"]
                     try:
                         result = self._do(page, action, state)
                     except Exception as exc:   # a bad coordinate, a closed page: the model is told
                         result = {"text": f"error: {type(exc).__name__}: {str(exc)[:200]}", "is_error": True}
+                    failed = bool(result.get("is_error"))
                     if state["pickers"] > before:
                         note = ("A file picker opened; it selected " + ", ".join(f["name"] for f in files) + "."
                                 if files else "A file picker opened; it was closed with no file.")
@@ -94,7 +104,11 @@ class Agent:
 
     @staticmethod
     def _shot(page, clip: dict[str, float] | None = None) -> str:
-        return base64.b64encode(page.screenshot(clip=clip, animations="allow", caret="initial")).decode()
+        # CSS pixels: the model's coordinates are then the coordinates page.mouse uses.
+        size = page.viewport_size or {"width": 0, "height": 0}
+        if max(size["width"], size["height"]) > MAX_SIDE or size["width"] * size["height"] > MAX_PIXELS:
+            raise ValueError(f"the viewport {size['width']}x{size['height']} is too large for a screenshot")
+        return base64.b64encode(page.screenshot(clip=clip, animations="allow", caret="initial", scale="css")).decode()
 
     def _do(self, page, action: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
         name, args = action.get("name"), action.get("input") or {}
@@ -118,10 +132,6 @@ class Agent:
         try:
             if name == "screenshot":
                 return {"image": self._shot(page)}
-            if name == "zoom":
-                x0, y0, x1, y1 = (float(v) for v in args["region"])
-                return {"image": self._shot(page, {"x": min(x0, x1), "y": min(y0, y1),
-                                                   "width": max(1.0, abs(x1 - x0)), "height": max(1.0, abs(y1 - y0))})}
             if name in CLICKS:
                 button, count = CLICKS[name]
                 x, y = at()

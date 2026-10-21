@@ -10,9 +10,10 @@ actions on the page with real input events.
 The model only does the task. It never gives the score: score() decides from
 facts, such as the requests the app sent.
 
-Limits keep the cost known: steps per session, sessions per evaluation, calls
-per evaluation. Only the newest screenshots stay in the conversation. Answers
-are not cached: a new screenshot is a new request.
+Limits keep the cost known: steps per session, and sessions, calls and tokens
+per evaluation; only the models in BRICK_RUNNER_AGENT_MODELS. Only the newest
+screenshots stay in the conversation. Answers are not cached: a new
+screenshot is a new request.
 
 The defect check does not run agent cases (see engine.py), because each
 mutant would pay for every session again.
@@ -20,17 +21,24 @@ mutant would pay for every session again.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from .judge import Judge, JudgeError
 
-TOOLSET = {"type": "computer_toolset_20260801"}
+# Zoom is off: a crop of the page has no more detail than the screenshot.
+TOOLSET = {"type": "computer_toolset_20260801", "configs": {"zoom": {"enabled": False}}}
 TOOLSET_NAME = "computer"
 MAX_TOKENS = 2048
 MAX_STEPS_PER_SESSION = 40
 MAX_SESSIONS_PER_EVALUATION = 120
 MAX_CALLS_PER_EVALUATION = 2500
+MAX_INPUT_TOKENS_PER_EVALUATION = 20_000_000
+MAX_OUTPUT_TOKENS_PER_EVALUATION = 1_000_000
+MAX_TEXT = 2000
+MAX_IMAGE = 8_000_000           # base64 characters
 KEEP_IMAGES = 3
+DEFAULT_MODELS = "claude-sonnet-5-5,claude-opus-5-5,claude-haiku-5-5"
 SYSTEM = ("You test a web app in a browser, for an automated evaluation. The app runs on test data. "
           "Do only the task you are given, in this page; do not open other sites. "
           "When the task is done or cannot be done, answer with no tool call: the first word is DONE or FAILED, "
@@ -38,13 +46,28 @@ SYSTEM = ("You test a web app in a browser, for an automated evaluation. The app
 
 
 class AgentError(RuntimeError):
-    pass
+    """The evaluation cannot go on. ``transient``: the API failed; try the evaluation again later."""
+
+    def __init__(self, message: str, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
+
+
+def allowed_models() -> set[str]:
+    return {m.strip() for m in os.environ.get("BRICK_RUNNER_AGENT_MODELS", DEFAULT_MODELS).split(",") if m.strip()}
 
 
 class Agents:
-    """The model side of every agent session in one evaluation."""
+    """The model side of every agent session in one evaluation.
+
+    A limit on one session ends that session (its case fails). A limit on the
+    whole evaluation ends the evaluation: a case that never ran must not pass.
+    """
 
     def __init__(self, judge: Judge, model: str) -> None:
+        if model not in allowed_models():
+            raise AgentError(f"AGENT model {model!r} is not allowed on this runner "
+                             f"(BRICK_RUNNER_AGENT_MODELS: {', '.join(sorted(allowed_models()))})")
         self.judge = judge
         self.model = model
         self.sessions: dict[str, dict[str, Any]] = {}
@@ -54,54 +77,83 @@ class Agents:
 
     def step(self, message: dict[str, Any]) -> dict[str, Any]:
         """One worker message -> the next actions, or the end of the session."""
-        name = str(message.get("session", ""))
+        results = message.get("results")
+        if not isinstance(results, list) or not all(_valid_result(r) for r in results):
+            return {"error": "results must be a list of {id?, image?, text?, is_error?} of limited size"}
+        name = message.get("session")
+        if not isinstance(name, str) or not name or len(name) > 64:
+            return {"error": "a session needs a name"}
         session = self.sessions.get(name)
         if session is None:
             if len(self.sessions) >= MAX_SESSIONS_PER_EVALUATION:
-                return {"error": f"limit: more than {MAX_SESSIONS_PER_EVALUATION} agent sessions in one evaluation"}
+                raise AgentError(f"more than {MAX_SESSIONS_PER_EVALUATION} agent sessions in one evaluation")
             task = message.get("task")
-            if not isinstance(task, str) or not task.strip():
+            if not isinstance(task, str) or not task.strip() or len(task) > 4000:
                 return {"error": "an agent session starts with a task"}
-            session = {"messages": [], "steps": 0, "pending": set()}
+            if len(results) != 1 or not isinstance(results[0].get("image"), str):
+                return {"error": "an agent session starts with one screenshot"}
+            session = {"messages": [], "steps": 0, "pending": set(), "closed": False}
             self.sessions[name] = session
-            first = _results_content(message.get("results") or [])
-            session["messages"].append({"role": "user", "content": [{"type": "text", "text": task[:4000]}, *first]})
+            session["messages"].append({"role": "user", "content": [{"type": "text", "text": task},
+                                                                     _image(results[0]["image"])]})
         else:
-            results = message.get("results") or []
-            ids = {str(r.get("id")) for r in results}
-            if ids != session["pending"]:
-                return {"error": "the results do not answer the last actions"}
+            if session["closed"]:
+                return {"error": "this session has ended"}
+            ids = [str(r.get("id")) for r in results]
+            if not ids or set(ids) != session["pending"] or len(ids) != len(session["pending"]):
+                return self._close(session, "the results do not answer the last actions")
             session["messages"].append({"role": "user", "content": [_tool_result(r) for r in results]})
         if session["steps"] >= MAX_STEPS_PER_SESSION:
-            return {"error": f"limit: more than {MAX_STEPS_PER_SESSION} steps in one task"}
+            return self._close(session, f"limit: more than {MAX_STEPS_PER_SESSION} steps in one task")
         if self.calls >= MAX_CALLS_PER_EVALUATION:
-            return {"error": f"limit: more than {MAX_CALLS_PER_EVALUATION} agent calls in one evaluation"}
+            raise AgentError(f"more than {MAX_CALLS_PER_EVALUATION} agent calls in one evaluation")
+        if self.input_tokens >= MAX_INPUT_TOKENS_PER_EVALUATION or self.output_tokens >= MAX_OUTPUT_TOKENS_PER_EVALUATION:
+            raise AgentError("the agent token budget for one evaluation is used up")
         _keep_newest_images(session["messages"], KEEP_IMAGES)
         body = {"model": self.model, "max_tokens": MAX_TOKENS, "system": SYSTEM, "tools": [TOOLSET],
                 "messages": session["messages"]}
         try:
             answer = self.judge.post(body)
         except JudgeError as exc:
-            raise AgentError(str(exc)) from None
+            raise AgentError(str(exc), transient=exc.transient) from None
         self.calls += 1
         session["steps"] += 1
-        usage = answer.get("usage") or {}
+        usage = answer.get("usage") if isinstance(answer.get("usage"), dict) else {}
         self.input_tokens += int(usage.get("input_tokens", 0) or 0)
         self.output_tokens += int(usage.get("output_tokens", 0) or 0)
-        content = answer.get("content") or []
+        content = answer.get("content") if isinstance(answer.get("content"), list) else []
+        stop = answer.get("stop_reason")
+        if stop not in (None, "tool_use", "end_turn", "stop_sequence"):
+            # max_tokens (a cut tool call), refusal, a full context: the session cannot go on.
+            return self._close(session, f"the model stopped: {stop}")
         session["messages"].append({"role": "assistant", "content": content})
         actions = [{"id": str(b.get("id")), "name": str(b.get("name")), "input": b.get("input") or {}}
-                   for b in content if b.get("type") == "tool_use"]
+                   for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
         if actions:
             session["pending"] = {a["id"] for a in actions}
             return {"actions": actions}
+        text = "".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text").strip()
+        self._close(session, "")
+        return {"done": True, "text": text[:MAX_TEXT]}
+
+    @staticmethod
+    def _close(session: dict[str, Any], reason: str) -> dict[str, Any]:
+        session["closed"] = True
         session["pending"] = set()
-        text = "".join(b.get("text", "") for b in content if b.get("type") == "text").strip()
-        return {"done": True, "text": text[:2000]}
+        return {"error": reason} if reason else {}
 
     def usage(self) -> dict[str, int]:
         return {"agent_sessions": len(self.sessions), "agent_calls": self.calls,
                 "agent_input_tokens": self.input_tokens, "agent_output_tokens": self.output_tokens}
+
+
+def _valid_result(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    image, text = result.get("image"), result.get("text")
+    return ((image is None or (isinstance(image, str) and len(image) <= MAX_IMAGE))
+            and (text is None or (isinstance(text, str) and len(text) <= MAX_TEXT))
+            and isinstance(result.get("is_error", False), bool))
 
 
 def _image(data: str) -> dict[str, Any]:
@@ -113,8 +165,8 @@ def _results_content(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for result in results:
         if isinstance(result.get("image"), str):
             blocks.append(_image(result["image"]))
-        if isinstance(result.get("text"), str):
-            blocks.append({"type": "text", "text": result["text"][:2000]})
+        if isinstance(result.get("text"), str) and result["text"]:
+            blocks.append({"type": "text", "text": result["text"][:MAX_TEXT]})
     return blocks
 
 
