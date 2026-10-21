@@ -181,10 +181,15 @@ class Runner:
                     name = exchange["name"] if ":" in exchange["name"] else f"external:{exchange['name']}"
                     # seq keeps two identical calls in one case apart: a record's ID is the hash of
                     # its content, so without it the store would keep only one of them.
-                    records.append({"kind": "exchange", "seq": seq, "name": name, "request": exchange["request"],
-                                    "request_hash": digest(exchange["request"]), "response": exchange["response"],
-                                    "response_hash": digest(exchange["response"]), "trace_id": trace,
-                                    "run_id": trace, "time": time})
+                    record = {"kind": "exchange", "seq": seq, "name": name, "request": exchange["request"],
+                              "request_hash": digest(exchange["request"]), "trace_id": trace,
+                              "run_id": trace, "time": time}
+                    if "error" in exchange and "response" not in exchange:
+                        # A recorded failure: the call raises, as a failed live call did.
+                        record["error"] = str(exchange["error"])
+                    else:
+                        record.update(response=exchange["response"], response_hash=digest(exchange["response"]))
+                    records.append(record)
         ids = self.store.add_records(records, source="synthetic")
         run_ids = [record_id for record_id, record in zip(ids, records) if record["kind"] == "run"]
         if not run_ids:
