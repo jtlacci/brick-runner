@@ -357,6 +357,9 @@ def _cost(result: dict[str, Any]) -> str:
     if counts.get("agent_calls"):
         tokens = counts.get("agent_input_tokens", 0) + counts.get("agent_output_tokens", 0)
         parts.append(f"{_number(counts['agent_calls'])} agent calls, {tokens / 1e6:.2f} M tokens")
+    if counts.get("model_calls") or counts.get("model_cached"):
+        parts.append(f"{_number(counts.get('model_calls', 0))} live model calls "
+                     f"({_number(counts.get('model_cached', 0))} cached), {counts.get('model_tokens', 0) / 1e6:.2f} M tokens")
     return ", ".join(parts)
 
 

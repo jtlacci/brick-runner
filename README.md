@@ -149,11 +149,15 @@ An `evaluate.py` with `JUDGE = {"model": ...}` and `judge_requests(record, outpu
 
 Setup: `npm` on the runner's PATH, and Chromium from `playwright install --with-deps chromium` in a folder the service can read, named by `BRICK_RUNNER_BROWSERS`. For `BRICK_RUNNER_BROWSER=chrome`: `playwright install --with-deps chrome` (Google Chrome in `/opt/google/chrome`) and the `xvfb` package.
 
+## Live model calls
+
+A brick that uses a model changes its requests whenever its prompt changes, so recorded answers stop matching and its cases are out of evidence. `live_externals: [anthropic]` in its `policy.yml` (human-only) lets the runner answer such a call live: when a case calls `external:anthropic` and has no recording for that exact request, the runner, outside the sandbox, sends it to the Messages API with the judge key. The request must be a Messages API body with an allowed model (`BRICK_RUNNER_AGENT_MODELS`) and `max_tokens` of at most 8192; other fields are dropped, and the key is never in it. Each answer is cached by request in `<home>/live/`, so the same code is evaluated with the same answers, and a rerun costs nothing. `budget.max_model_calls` and `budget.max_model_tokens` limit one run; over a limit, the run fails. An API outage records nothing, and the service tries again. A request the runner refuses (a model that is not allowed) fails that case.
+
 ## Evaluation budgets
 
 An evaluation gains from each new case, and nothing else makes it pay for one. So:
 
-- **Budget.** `budget` in `policy.yml` (`max_cases`, `max_seconds`, `max_agent_calls`, `max_agent_tokens`) limits one run of one split. Over `max_cases`, the run fails before it starts; over the others, it fails with a `budget:` reason. `policy.yml` is human-only and comes from the base commit, so a change cannot raise its own budget. An agent budget can only be lower than the runner's limits.
+- **Budget.** `budget` in `policy.yml` (`max_cases`, `max_seconds`, `max_agent_calls`, `max_agent_tokens`, `max_model_calls`, `max_model_tokens`) limits one run of one split. Over `max_cases`, the run fails before it starts; over the others, it fails with a `budget:` reason. `policy.yml` is human-only and comes from the base commit, so a change cannot raise its own budget. An agent budget can only be lower than the runner's limits.
 - **Cost line.** Each comment says what a run cost: cases, seconds, agent calls and tokens. An evaluation change shows the cost before and after, and the difference.
 - **Dead cases.** The defect check records which development cases catch which mutants (a case catches a mutant when its metric falls, or it gives no score). The comment says how many cases catch one. A change gets a bloat warning when cases catch nothing, when it adds cases and catches no more mutants than the last passed defect check, or when a run takes more than 1.5 times as long. A warning does not fail the change; the budget is the hard limit.
 

@@ -7,6 +7,7 @@ comes here. The broker answers from the case's pinned exchanges:
 | --- | --- | --- |
 | external | yes | the recorded response (or the recorded failure) |
 | external | no | out of evidence: the case is excluded and counted |
+| external named in live_externals | no | the runner asks the provider (live.py), cached by request |
 | sibling, nondeterministic | yes | the recorded response |
 | sibling, deterministic | hash | the sibling runs again in a dependency worker; a different hash is a mismatch |
 | sibling, nondeterministic | no | the sibling runs again in a dependency worker (regenerated, counted, never stored) |
@@ -57,7 +58,8 @@ class CaseState:
 
 class Broker:
     def __init__(self, sandbox: Sandbox, dependencies: Path, deterministic: Callable[[str], bool],
-                 deadline: float) -> None:
+                 deadline: float, live: Any = None) -> None:
+        self.live = live
         self.sandbox = sandbox
         self.dependencies = dependencies
         self.deterministic = deterministic
@@ -96,6 +98,16 @@ class Broker:
     def _external(self, state: CaseState, message: dict[str, Any]) -> dict[str, Any]:
         name = f"external:{message.get('name')}"
         record = state.take(name, message.get("request"))
+        if record is None and self.live is not None and message.get("name") in self.live.names:
+            from .live import LiveError
+            try:
+                response = self.live.answer(str(message.get("name")), message.get("request"))
+            except LiveError as exc:
+                if exc.transient or exc.fatal:
+                    raise   # the evaluation stops: an outage is retried, a used-up budget fails the run
+                return {"raise": "error", "message": f"live {name}: {exc}"}
+            state.calls.append({"name": name, "request": message.get("request"), "live": True})
+            return {"response": response}
         if record is None:
             state.out_of_evidence = True
             return {"raise": "out_of_evidence", "message": f"no recorded response for {name}"}
@@ -136,9 +148,9 @@ class Broker:
 
 def run_cases(sandbox: Sandbox, brick: str, candidate: Path, dependencies: Path,
               deterministic: Callable[[str], bool], cases: list[dict[str, Any]],
-              timeout: float = 600) -> tuple[list[dict[str, Any]], str]:
+              timeout: float = 600, live: Any = None) -> tuple[list[dict[str, Any]], str]:
     """Run every case through a fresh candidate worker. Returns (results, candidate log)."""
-    broker = Broker(sandbox, dependencies, deterministic, time.monotonic() + timeout)
+    broker = Broker(sandbox, dependencies, deterministic, time.monotonic() + timeout, live)
     worker = broker.start(brick, candidate)
     results = []
     try:

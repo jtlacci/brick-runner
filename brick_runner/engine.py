@@ -22,6 +22,7 @@ from typing import Any, Iterator
 
 from . import broker, mutate, splits, web, workspace
 from .agent import AgentError, Agents
+from .live import Live, LiveError
 from .gitrepo import Repo
 from .hashing import canonical, digest
 from .judge import MAX_REQUESTS_PER_CASE, MAX_REQUESTS_PER_EVALUATION, Judge, JudgeError
@@ -297,7 +298,11 @@ class Runner:
         if skipped_agent:
             counts["agent_cases_skipped"] = skipped_agent
         agents = None
+        live = None
         try:
+            if policy.live_externals:
+                live = Live(self.judge, policy.live_externals, self.home / "live",
+                            max_calls=budget.get("max_model_calls"), max_tokens=budget.get("max_model_tokens"))
             if declared_agent and agent:
                 agents = Agents(self.judge, declared_agent["model"], max_calls=budget.get("max_agent_calls"),
                                 max_tokens=budget.get("max_agent_tokens"))
@@ -305,7 +310,7 @@ class Runner:
                 results, log = self._run_web(brick, ws, cases, agents)
             else:
                 results, log = broker.run_cases(self.sandbox, brick, ws.code, ws.deps,
-                                                functools.partial(self._deterministic, base), cases)
+                                                functools.partial(self._deterministic, base), cases, live=live)
         except web.BuildError as exc:
             return {"passed": False, "terms": {}, "gates": [], "counts": counts, "fatal": str(exc),
                     "reasons": [f"the web build failed: {exc}"], "counterexamples": examples,
@@ -314,6 +319,12 @@ class Runner:
             return {"passed": False, "terms": {}, "gates": [], "counts": counts, "fatal": str(exc),
                     "reasons": [f"the candidate worker failed: {exc}"], "counterexamples": examples,
                     "log": exc.log[-LOG_LIMIT:]}
+        except LiveError as exc:
+            if exc.transient:
+                raise RunnerError(f"the live model API failed; try again: {exc}") from None
+            counts.update(live.usage() if live else {})
+            return {"passed": False, "terms": {}, "gates": [], "counts": counts, "fatal": str(exc),
+                    "reasons": [f"live model calls stopped: {exc}"], "counterexamples": examples, "log": ""}
         except AgentError as exc:
             if exc.transient:
                 # The API failed, not the candidate: no result is recorded, so a retry runs it again.
@@ -324,6 +335,8 @@ class Runner:
                     "log": ""}
         if agents:
             counts.update(agents.usage())
+        if live:
+            counts.update(live.usage())
         items, outcomes = [], []
         for record, result in zip(kept, results):
             counts["determinism_mismatches"] += result["mismatches"]
