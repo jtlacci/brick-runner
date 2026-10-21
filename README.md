@@ -149,6 +149,14 @@ An `evaluate.py` with `JUDGE = {"model": ...}` and `judge_requests(record, outpu
 
 Setup: `npm` on the runner's PATH, and Chromium from `playwright install --with-deps chromium` in a folder the service can read, named by `BRICK_RUNNER_BROWSERS`. For `BRICK_RUNNER_BROWSER=chrome`: `playwright install --with-deps chrome` (Google Chrome in `/opt/google/chrome`) and the `xvfb` package.
 
+## Evaluation budgets
+
+An evaluation gains from each new case, and nothing else makes it pay for one. So:
+
+- **Budget.** `budget` in `policy.yml` (`max_cases`, `max_seconds`, `max_agent_calls`, `max_agent_tokens`) limits one run of one split. Over `max_cases`, the run fails before it starts; over the others, it fails with a `budget:` reason. `policy.yml` is human-only and comes from the base commit, so a change cannot raise its own budget. An agent budget can only be lower than the runner's limits.
+- **Cost line.** Each comment says what a run cost: cases, seconds, agent calls and tokens. An evaluation change shows the cost before and after, and the difference.
+- **Dead cases.** The defect check records which development cases catch which mutants (a case catches a mutant when its metric falls, or it gives no score). The comment says how many cases catch one. A change gets a bloat warning when cases catch nothing, when it adds cases and catches no more mutants than the last passed defect check, or when a run takes more than 1.5 times as long. A warning does not fail the change; the budget is the hard limit.
+
 ## Limits
 
 - The runner runs evaluations one at a time (a file lock). There is no queue service.

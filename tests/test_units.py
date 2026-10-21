@@ -183,3 +183,41 @@ class SandboxTmpTests(unittest.TestCase):
         finally:
             planted.unlink()
             shutil.rmtree(work, ignore_errors=True)
+
+
+
+class BloatTests(unittest.TestCase):
+    def test_more_cases_that_catch_no_more_are_flagged(self) -> None:
+        from brick_runner.engine import bloat
+        before = {"strengths": {"1": {"detected": 2}, "4": {"detected": 4}}, "cases": {"caught": 10}}
+        same = {"strengths": {"1": {"detected": 2}, "4": {"detected": 4}},
+                "cases": {"scored": 40, "dead": 5, "caught": 35, "mutants": 12}}
+        old = {"counts": {"cases": 20}, "seconds": 100}
+        new = {"counts": {"cases": 40}, "seconds": 200}
+        notes = bloat(before, same, old, new)
+        self.assertTrue(any("adds 20 cases and catches no more mutants" in n for n in notes), notes)
+        self.assertTrue(any("5 of 40" in n for n in notes), notes)
+        self.assertTrue(any("takes 200 s, before 100 s" in n for n in notes), notes)
+        better = dict(same, strengths={"1": {"detected": 3}, "4": {"detected": 4}}, cases={"scored": 40, "dead": 0, "caught": 40})
+        self.assertEqual(bloat(before, better, old, {"counts": {"cases": 40}, "seconds": 110}), [])
+        self.assertEqual(bloat(None, {"cases": {}}, old, new)[-1], "a run takes 200 s, before 100 s")
+
+    def test_the_comment_shows_cost_and_bloat(self) -> None:
+        from brick_runner.serve import render_code, render_evaluation
+        run = {"passed": True, "terms": {"x": 1.0}, "gates": [], "counts": {"cases": 10, "scored": 10, "agent_calls": 4,
+               "agent_input_tokens": 900_000, "agent_output_tokens": 100_000}, "seconds": 61.2}
+        text = render_code("web", run, run)
+        self.assertIn("Cost: development 10 cases, 61 s, 4 agent calls, 1&#46;00 M tokens", text)
+        change = {"defect_check": {"passed": True, "reason": "ok", "metric": "x", "baseline": 1, "strengths": {},
+                                   "cases": {"scored": 10, "caught": 8, "dead": 2, "mutants": 12}},
+                  "production_under_old": {"counts": {"cases": 8}, "seconds": 50},
+                  "production_under_new": run, "bloat": ["2 of 10 development cases catch none of the 12 mutants"],
+                  "next": "merge"}
+        text = render_evaluation("web", change)
+        self.assertIn("Cases that catch a mutant: 8 of 10", text)
+        self.assertIn("&#43;2 cases, &#43;11 s, &#43;4 agent calls", text)
+        self.assertIn("Bloat: 2 of 10", text)
+        # A comment from before this change still renders.
+        old_change = {k: v for k, v in change.items() if k != "bloat"}
+        old_change["defect_check"] = {k: v for k, v in change["defect_check"].items() if k != "cases"}
+        self.assertIn("Defect check", render_evaluation("web", old_change))

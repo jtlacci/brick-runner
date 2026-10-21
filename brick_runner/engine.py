@@ -46,6 +46,36 @@ class RunnerError(RuntimeError):
     pass
 
 
+def bloat(before: dict[str, Any] | None, after: dict[str, Any], old: dict[str, Any], new: dict[str, Any]) -> list[str]:
+    """Warnings for an evaluation change that costs more and catches no more.
+
+    A case must earn its place: it catches a mutant that the baseline does not
+    lose, or it is the only case of a gate. Warnings do not fail the change; the
+    budget in policy.yml is the hard limit.
+    """
+    notes = []
+    cases = after.get("cases") or {}
+    if cases.get("dead"):
+        notes.append(f"{cases['dead']} of {cases['scored']} development cases catch none of the "
+                     f"{cases.get('mutants', 0)} mutants")
+    old_cases = (old.get("counts") or {}).get("cases", 0)
+    new_cases = (new.get("counts") or {}).get("cases", 0)
+    if before and new_cases > old_cases:
+        earlier = (before.get("cases") or {}).get("caught")
+        caught_before = sum(s.get("detected", 0) for s in (before.get("strengths") or {}).values())
+        caught_after = sum(s.get("detected", 0) for s in (after.get("strengths") or {}).values())
+        if caught_after <= caught_before:
+            notes.append(f"this change adds {new_cases - old_cases} cases and catches no more mutants "
+                         f"({caught_after}, before {caught_before})")
+        elif earlier is not None and cases.get("caught", 0) <= earlier:
+            notes.append(f"this change adds {new_cases - old_cases} cases, and no more cases catch a mutant")
+    seconds_old, seconds_new = old.get("seconds"), new.get("seconds")
+    if isinstance(seconds_old, (int, float)) and isinstance(seconds_new, (int, float)) and seconds_old > 0 \
+            and seconds_new > 1.5 * seconds_old:
+        notes.append(f"a run takes {seconds_new:.0f} s, before {seconds_old:.0f} s")
+    return notes
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
@@ -233,6 +263,13 @@ class Runner:
                   "score_errors": 0, "determinism_mismatches": 0, "regenerated": 0, "scored": 0}
         examples: list[dict[str, Any]] = []
         reasons: list[str] = []
+        budget = policy.budget
+        clock = time.monotonic()
+        if "max_cases" in budget and len(records) > budget["max_cases"]:
+            # Over budget before anything runs: no time is spent on it.
+            return {"passed": False, "terms": {}, "gates": [], "counts": counts, "seconds": 0.0,
+                    "reasons": [f"budget: {len(records)} cases; the policy allows {budget['max_cases']} in one split"],
+                    "counterexamples": [], "log": ""}
         declared = self._evaluator(ws, {"command": "gates"})
         gates = declared["gates"]
         if not all(isinstance(g, list) and len(g) == 3 and isinstance(g[0], str) and g[1] in OPERATORS
@@ -262,7 +299,8 @@ class Runner:
         agents = None
         try:
             if declared_agent and agent:
-                agents = Agents(self.judge, declared_agent["model"])
+                agents = Agents(self.judge, declared_agent["model"], max_calls=budget.get("max_agent_calls"),
+                                max_tokens=budget.get("max_agent_tokens"))
             if self.kind(base, brick) == "web":
                 results, log = self._run_web(brick, ws, cases, agents)
             else:
@@ -345,8 +383,13 @@ class Runner:
             reasons.append("judge_requests() failed on some cases")
         if policy.metric not in means:
             reasons.append(f"no {policy.metric!r} term to rank by")
-        return {"passed": not reasons, "terms": means, "gates": gate_results, "counts": counts,
-                "reasons": reasons, "counterexamples": examples[:50], "log": log[-LOG_LIMIT:]}
+        seconds = time.monotonic() - clock
+        if "max_seconds" in budget and seconds > budget["max_seconds"]:
+            reasons.append(f"budget: the run took {seconds:.0f} s; the policy allows {budget['max_seconds']} s")
+        # Each case's metric, so the defect check can tell which cases catch which defects.
+        case_metric = {record["id"]: terms.get(policy.metric) for record, _, terms in per_case}
+        return {"passed": not reasons, "terms": means, "gates": gate_results, "counts": counts, "seconds": seconds,
+                "per_case": case_metric, "reasons": reasons, "counterexamples": examples[:50], "log": log[-LOG_LIMIT:]}
 
     def _run_web(self, brick: str, ws: Workspace, cases: list[dict[str, Any]],
                  agents: Agents | None = None) -> tuple[list[dict[str, Any]], str]:
@@ -602,6 +645,9 @@ class Runner:
                 tolerance = 1e-9 + 0.01 * abs(base_value)
                 raw: dict[int, list[float | None]] = {}
                 unbuildable = {strength: 0 for strength in DEFECT_STRENGTHS}
+                base_cases = {k: v for k, v in (baseline.get("per_case") or {}).items() if v is not None}
+                caught: dict[str, int] = {case: 0 for case in base_cases}   # mutants each case catches
+                mutants = 0
                 for strength in DEFECT_STRENGTHS:
                     raw[strength] = []
                     for seed in DEFECT_SEEDS:
@@ -617,6 +663,13 @@ class Runner:
                                 unbuildable[strength] += 1   # neither caught nor missed
                                 continue
                             raw[strength].append(result.get("terms", {}).get(policy.metric))
+                            mutants += 1
+                            seen = result.get("per_case") or {}
+                            for case, value in base_cases.items():
+                                # Lower than in the baseline, or no score at all (it crashed): caught.
+                                got = seen.get(case)
+                                if got is None or got < value - tolerance:
+                                    caught[case] += 1
                         finally:
                             mutant.cleanup()
                 # A mutant with no score (it crashed, or every case left the evidence) is
@@ -636,6 +689,9 @@ class Runner:
                 enough = strongest["detected"] * 2 >= strongest["of"]
                 # Most mutants must build: otherwise the check measures the build, not the evaluation.
                 built = all(len(raw[s]) * 2 >= len(DEFECT_SEEDS) for s in DEFECT_STRENGTHS)
+                dead = sorted(case for case, n in caught.items() if n == 0)
+                report["cases"] = {"scored": len(base_cases), "mutants": mutants, "dead": len(dead),
+                                   "dead_ids": dead[:200], "caught": sum(1 for n in caught.values() if n)}
                 report["passed"] = monotonic and below and enough and built
                 report["reason"] = ("scores fall as defects grow" if report["passed"] else
                                     "most mutants do not build, so the check cannot measure the evaluation" if not built else
@@ -645,18 +701,26 @@ class Runner:
                                                   "passed": report["passed"]}, {}, report)
         return report
 
+    def _last_defect_check(self, brick: str, base: str) -> dict[str, Any] | None:
+        """The last passed defect check of the evaluation on the base commit, if the ledger has one."""
+        tree = self.repo.tree(base, f"bricks/{brick}/evaluation")
+        found = self.ledger.find(brick, kind="defect-check", eval_tree=tree or "", passed="True")
+        return self.ledger.envelope(found[0].run_id) if found else None
+
     def evaluation_change(self, brick: str, commit: str) -> dict[str, Any]:
         """An eval-agent submission: the production code, the candidate evaluation."""
         base = self.base()
         commit = self.repo.commit(commit)
         impl = self.production_commit(brick, base)
+        before = self._last_defect_check(brick, base)
         report = self.defect_check(brick, impl_commit=impl, eval_commit=commit, base=base)
         with self.exclusive():
             old = self.evaluate(brick, splits.DEVELOPMENT, [Overlay(brick, CODE, impl)], base=base, kind="comparison")
             new = self.evaluate(brick, splits.DEVELOPMENT, [Overlay(brick, CODE, impl), Overlay(brick, EVALUATION, commit)],
                                 base=base, kind="comparison")
-        return {"defect_check": report,
-                "production_under_old": {k: old.get(k) for k in ("passed", "terms", "gates", "counts")},
-                "production_under_new": {k: new.get(k) for k in ("passed", "terms", "gates", "counts")},
+        keys = ("passed", "terms", "gates", "counts", "seconds")
+        return {"defect_check": report, "bloat": bloat(before, report, old, new),
+                "production_under_old": {k: old.get(k) for k in keys},
+                "production_under_new": {k: new.get(k) for k in keys},
                 "next": "a human approves the change; when it merges, a new epoch starts"
                         if report["passed"] else "fix the evaluation: it does not detect controlled defects"}

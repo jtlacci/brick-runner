@@ -18,6 +18,9 @@ class PolicyError(ValueError):
     pass
 
 
+BUDGET_KEYS = ("max_cases", "max_seconds", "max_agent_calls", "max_agent_tokens")
+
+
 @dataclass(frozen=True)
 class Policy:
     raw: dict[str, Any]
@@ -45,6 +48,12 @@ class Policy:
     @property
     def max_out_of_evidence(self) -> float:
         return float(self.raw.get("max_out_of_evidence", 0.05))
+
+    @property
+    def budget(self) -> dict[str, int]:
+        """Limits on one evaluation run of one split (human-only, so a change cannot raise its own)."""
+        raw = self.raw.get("budget") or {}
+        return {k: int(raw[k]) for k in BUDGET_KEYS if isinstance(raw.get(k), int) and not isinstance(raw.get(k), bool)}
 
     def classify(self, path: str) -> str:
         if path in ALWAYS_HUMAN:

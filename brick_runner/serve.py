@@ -348,6 +348,34 @@ def _terms(terms: dict[str, Any]) -> str:
     return ", ".join(f"{_escape(k)} {_number(v)}" for k, v in sorted(terms.items())) or "–"
 
 
+def _cost(result: dict[str, Any]) -> str:
+    """What one run cost: cases, time and agent use."""
+    counts = result.get("counts") or {}
+    parts = [f"{_number(counts.get('cases', 0))} cases"]
+    if isinstance(result.get("seconds"), (int, float)):
+        parts.append(f"{result['seconds']:.0f} s")
+    if counts.get("agent_calls"):
+        tokens = counts.get("agent_input_tokens", 0) + counts.get("agent_output_tokens", 0)
+        parts.append(f"{_number(counts['agent_calls'])} agent calls, {tokens / 1e6:.2f} M tokens")
+    return ", ".join(parts)
+
+
+def _delta(old: dict[str, Any], new: dict[str, Any]) -> str:
+    def value(result, key):
+        counts = result.get("counts") or {}
+        if key == "seconds":
+            return result.get("seconds")
+        if key == "tokens":
+            return counts.get("agent_input_tokens", 0) + counts.get("agent_output_tokens", 0)
+        return counts.get(key, 0)
+    parts = []
+    for key, unit in (("cases", " cases"), ("seconds", " s"), ("agent_calls", " agent calls"), ("tokens", " tokens")):
+        a, b = value(old, key), value(new, key)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)) and round(b - a):
+            parts.append(f"{b - a:+.0f}{unit}")
+    return ", ".join(parts) or "no change"
+
+
 def render_code(brick: str, development: dict[str, Any], validation: dict[str, Any]) -> str:
     rows = ["| Split | Result | Terms | Gates | Cases | Out of evidence |", "| --- | --- | --- | --- | --- | --- |"]
     for name, result in (("development", development), ("validation", validation)):
@@ -355,7 +383,8 @@ def render_code(brick: str, development: dict[str, Any], validation: dict[str, A
         rows.append(f"| {name} | {'✅ passed' if result.get('passed') else '❌ failed'} | {_terms(result.get('terms', {}))} | "
                     f"{_gates(result)} | {_number(counts.get('scored', 0))}/{_number(counts.get('cases', 0))} | "
                     f"{_number(counts.get('out_of_evidence', 0))} |")
-    parts = [f"#### {_code(brick)} (code loop)", "\n".join(rows)]
+    parts = [f"#### {_code(brick)} (code loop)", "\n".join(rows),
+             f"Cost: development {_escape(_cost(development))}; validation {_escape(_cost(validation))}."]
     reasons = list(dict.fromkeys(development.get("reasons", []) + validation.get("reasons", [])))
     if reasons:
         parts.append("Reasons: " + "; ".join(_escape(r) for r in reasons))
@@ -375,15 +404,25 @@ def render_evaluation(brick: str, change: dict[str, Any]) -> str:
     for strength, item in sorted(check.get("strengths", {}).items(), key=lambda kv: int(kv[0])):
         rows.append(f"| {_escape(strength)} | {_number(item['median'])} | {_number(item['detected'])}/{_number(item['of'])} |")
     old, new = change["production_under_old"], change["production_under_new"]
-    return "\n\n".join([
+    cases = check.get("cases") or {}
+    parts = [
         f"#### {_code(brick)} (evaluation loop)",
         f"Defect check: {'✅ passed' if check.get('passed') else '❌ failed'}: {_escape(check.get('reason'))}. "
         f"Baseline {_escape(check.get('metric'))}: {_number(check.get('baseline'))}.",
-        "\n".join(rows),
+        "\n".join(rows)]
+    if cases:
+        parts.append(f"Cases that catch a mutant: {_number(cases.get('caught'))} of {_number(cases.get('scored'))} "
+                     f"(development, {_number(cases.get('mutants'))} mutants).")
+    parts += [
         f"Production under the current evaluation: {'passed' if old.get('passed') else 'failed'} "
         f"({_terms(old.get('terms') or {})}). Under this change: {'passed' if new.get('passed') else 'failed'} "
         f"({_terms(new.get('terms') or {})}).",
-        f"Next: {_escape(change['next'])}."])
+        f"Cost of one development run: before {_escape(_cost(old))}; after {_escape(_cost(new))} "
+        f"({_escape(_delta(old, new))})."]
+    if change.get("bloat"):
+        parts.append("⚠️ Bloat: " + "; ".join(_escape(n) for n in change["bloat"]) + ".")
+    parts.append(f"Next: {_escape(change['next'])}.")
+    return "\n\n".join(parts)
 
 
 def render_command(action: str, brick: str, result: dict[str, Any]) -> str:

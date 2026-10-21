@@ -543,6 +543,42 @@ class WebScenario(unittest.TestCase):
             FakeAgent.mode = "ok"
             server.shutdown()
 
+    def _with_budget(self, name: str, budget: str) -> str:
+        import re
+        text = (self.root / "bricks/web/evaluation/policy.yml").read_text()
+        text = re.sub(r"\nbudget:\n(  .*\n)*", "\n", text)
+        policy = text + "\nbudget:\n" + budget
+        return self.branch(name, {"bricks/web/evaluation/policy.yml": policy,
+                                  "bricks/web/app/src/main.js": WEB["app/src/main.js"] + f"// {name}\n"})
+
+    def test_19_the_case_budget_stops_a_run_before_it_starts(self) -> None:
+        base = self.runner.repo.commit(self._with_budget("budget-cases", "  max_cases: 1\n"))
+        result = self.runner.evaluate("web", "development", [], base=base, cache=False)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any(r.startswith("budget:") and "cases" in r for r in result["reasons"]), result["reasons"])
+        self.assertEqual(result["seconds"], 0.0)
+
+    def test_20_the_time_budget_fails_a_slow_run(self) -> None:
+        base = self.runner.repo.commit(self._with_budget("budget-time", "  max_seconds: 1\n"))
+        slow = WEB["evaluation/evaluate.py"].replace('page.goto(base_url + "/")', 'page.goto(base_url + "/"); page.wait_for_timeout(1500)')
+        commit = self.branch("budget-time-slow", {"bricks/web/evaluation/evaluate.py": slow})
+        from brick_runner.workspace import Overlay
+        result = self.runner.evaluate("web", "development", [Overlay("web", "evaluation", self.runner.repo.commit(commit))],
+                                      base=base, cache=False)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any(r.startswith("budget: the run took") for r in result["reasons"]), result["reasons"])
+
+    def test_21_the_defect_check_names_dead_cases(self) -> None:
+        commit = self.branch("dead", {"bricks/web/evaluation/evaluate.py": WEB["evaluation/evaluate.py"].replace(
+            "            return [{\"input\": {\"width\": width}} for width in (375, 1280)]",
+            "            return [{\"input\": {\"width\": width}} for width in (375, 1280, 800, 900, 1000)]")})
+        view = self.runner.evaluation_change("web", commit)
+        cases = view["defect_check"]["cases"]
+        self.assertGreater(cases["scored"], 0)
+        self.assertEqual(cases["dead"] + cases["caught"], cases["scored"])
+        self.assertIn("seconds", view["production_under_new"])
+        self.assertIsInstance(view["bloat"], list)
+
     def test_17_parallel_workers_keep_case_order(self) -> None:
         server, env = self._agent_env()
         FakeAgent.mode = "ok"

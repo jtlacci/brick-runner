@@ -65,12 +65,15 @@ class Agents:
     whole evaluation ends the evaluation: a case that never ran must not pass.
     """
 
-    def __init__(self, judge: Judge, model: str) -> None:
+    def __init__(self, judge: Judge, model: str, max_calls: int | None = None, max_tokens: int | None = None) -> None:
         if model not in allowed_models():
             raise AgentError(f"AGENT model {model!r} is not allowed on this runner "
                              f"(BRICK_RUNNER_AGENT_MODELS: {', '.join(sorted(allowed_models()))})")
         self.judge = judge
         self.model = model
+        # The brick's budget may be lower than the runner's own limits, never higher.
+        self.max_calls = min(MAX_CALLS_PER_EVALUATION, max_calls or MAX_CALLS_PER_EVALUATION)
+        self.max_tokens = min(MAX_INPUT_TOKENS_PER_EVALUATION, max_tokens or MAX_INPUT_TOKENS_PER_EVALUATION)
         self.sessions: dict[str, dict[str, Any]] = {}
         self.calls = 0
         self.input_tokens = 0
@@ -113,10 +116,10 @@ class Agents:
         if session["steps"] >= MAX_STEPS_PER_SESSION:
             return self._close(session, f"limit: more than {MAX_STEPS_PER_SESSION} steps in one task")
         with self._lock:
-            if self.calls >= MAX_CALLS_PER_EVALUATION:
-                raise AgentError(f"more than {MAX_CALLS_PER_EVALUATION} agent calls in one evaluation")
-            if self.input_tokens >= MAX_INPUT_TOKENS_PER_EVALUATION or self.output_tokens >= MAX_OUTPUT_TOKENS_PER_EVALUATION:
-                raise AgentError("the agent token budget for one evaluation is used up")
+            if self.calls >= self.max_calls:
+                raise AgentError(f"budget: more than {self.max_calls} agent calls in one evaluation")
+            if self.input_tokens + self.output_tokens >= self.max_tokens or self.output_tokens >= MAX_OUTPUT_TOKENS_PER_EVALUATION:
+                raise AgentError(f"budget: more than {self.max_tokens} agent tokens in one evaluation")
             self.calls += 1   # counted before the call, so parallel workers cannot pass the limit
         _keep_newest_images(session["messages"], KEEP_IMAGES)
         body = {"model": self.model, "max_tokens": MAX_TOKENS, "system": SYSTEM, "tools": [TOOLSET],
