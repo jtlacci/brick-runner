@@ -70,8 +70,10 @@ WRITER = {
             return record["input"]
 
 
-        def score(record, output, later):
-            return {"wrote": 1.0 if output and output.get("text") else 0.0}
+        def score(record, output, later, calls=()):
+            # score() sees the answer the brick got, live or recorded.
+            text = "".join(b.get("text", "") for c in calls for b in (c.get("response") or {}).get("content", []))
+            return {"wrote": 1.0 if output and output.get("text") and output["text"] == text else 0.0}
 
 
         def generate(seed):

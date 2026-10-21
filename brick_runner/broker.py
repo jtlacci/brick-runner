@@ -52,8 +52,13 @@ class CaseState:
         if index >= len(records):
             return None
         self.used[key] = index + 1
-        self.calls.append({"name": name, "request": request})
-        return records[index]
+        record = records[index]
+        call = {"name": name, "request": request}
+        for field in ("response", "error"):
+            if field in record:
+                call[field] = record[field]
+        self.calls.append(call)
+        return record
 
 
 class Broker:
@@ -106,7 +111,7 @@ class Broker:
                 if exc.transient or exc.fatal:
                     raise   # the evaluation stops: an outage is retried, a used-up budget fails the run
                 return {"raise": "error", "message": f"live {name}: {exc}"}
-            state.calls.append({"name": name, "request": message.get("request"), "live": True})
+            state.calls.append({"name": name, "request": message.get("request"), "response": response, "live": True})
             return {"response": response}
         if record is None:
             state.out_of_evidence = True
