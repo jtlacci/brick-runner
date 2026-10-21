@@ -233,6 +233,7 @@ class AgentUnitTests(unittest.TestCase):
                     {"role": "user", "content": [{"type": "tool_result", "content": [dict(image)]}]}]
         _keep_newest_images(messages, 2)
         self.assertEqual(messages[0]["content"][1]["type"], "text")
+        self.assertIn("removed to save space", messages[0]["content"][1]["text"])
         self.assertEqual(messages[1]["content"][0]["content"][0]["type"], "image")
         self.assertEqual(messages[2]["content"][0]["content"][0]["type"], "image")
 

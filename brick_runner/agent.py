@@ -38,7 +38,8 @@ MAX_INPUT_TOKENS_PER_EVALUATION = 20_000_000
 MAX_OUTPUT_TOKENS_PER_EVALUATION = 1_000_000
 MAX_TEXT = 2000
 MAX_IMAGE = 8_000_000           # base64 characters
-KEEP_IMAGES = 3
+KEEP_IMAGES = 5
+REMOVED = "[An older screenshot was removed to save space. What it showed is in your earlier notes.]"
 DEFAULT_MODELS = "claude-sonnet-5-5,claude-opus-5-5,claude-haiku-5-5"
 SYSTEM = ("You test a web app in a browser, for an automated evaluation. The app runs on test data. "
           "Do only the task you are given, in this page; do not open other sites. "
@@ -203,4 +204,4 @@ def _keep_newest_images(messages: list[dict[str, Any]], keep: int) -> None:
                          if b.get("type") == "tool_result" and isinstance(b.get("content"), list))
     places = [(blocks, i) for blocks in lists for i, b in enumerate(blocks) if b.get("type") == "image"]
     for blocks, i in places[:max(0, len(places) - keep)]:
-        blocks[i] = {"type": "text", "text": "[an earlier screenshot]"}
+        blocks[i] = {"type": "text", "text": REMOVED}

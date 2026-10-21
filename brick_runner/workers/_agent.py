@@ -76,7 +76,8 @@ class Agent:
                     notes = (notes + [str(reply["note"])[:300]])[-8:]
                 results = []
                 failed = False
-                for action in reply["actions"]:
+                batch = reply["actions"]
+                for index, action in enumerate(batch):
                     if failed:
                         # After a failed action the rest of the turn is not done: a click that missed,
                         # then typing, would type into the wrong place.
@@ -85,7 +86,9 @@ class Agent:
                     actions.append(action.get("name", "?"))
                     before = state["pickers"]
                     try:
-                        result = self._do(page, action, state)
+                        # Only the last action of a turn sends the new screen: three screenshots
+                        # for click, wait, screenshot cost more and tell the model nothing new.
+                        result = self._do(page, action, state, last=index == len(batch) - 1)
                     except Exception as exc:   # a bad coordinate, a closed page: the model is told
                         result = {"text": f"error: {type(exc).__name__}: {str(exc)[:200]}", "is_error": True}
                     failed = bool(result.get("is_error"))
@@ -113,7 +116,7 @@ class Agent:
             raise ValueError(f"the viewport {size['width']}x{size['height']} is too large for a screenshot")
         return base64.b64encode(page.screenshot(clip=clip, animations="allow", caret="initial", scale="css")).decode()
 
-    def _do(self, page, action: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    def _do(self, page, action: dict[str, Any], state: dict[str, Any], last: bool = True) -> dict[str, Any]:
         name, args = action.get("name"), action.get("input") or {}
         mouse, keyboard = page.mouse, page.keyboard
 
@@ -179,7 +182,7 @@ class Agent:
         finally:
             for key in reversed(held):
                 keyboard.up(key)
-        if name in CHANGES:
+        if name in CHANGES and last:
             # After a change the model gets the new screen at once: one call less per step.
             page.wait_for_timeout(SETTLE_MS)
             return {"image": self._shot(page)}
