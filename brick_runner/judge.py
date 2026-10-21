@@ -89,15 +89,19 @@ class Judge:
         return text
 
     def _post(self, body: dict[str, Any]) -> str:
+        answer = self.post(body)
+        return "".join(block.get("text", "") for block in answer.get("content", []) if block.get("type") == "text")
+
+    def post(self, body: dict[str, Any]) -> dict[str, Any]:
+        """One Messages API call; the whole answer. Retries on overload."""
         url = os.environ.get("BRICK_RUNNER_JUDGE_URL", API_URL)
         data = json.dumps(body).encode()
         headers = {"content-type": "application/json", "anthropic-version": API_VERSION, "x-api-key": self._key()}
         delay = 2.0
         for attempt in range(ATTEMPTS):
             try:
-                with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers), timeout=120) as r:
-                    answer = json.load(r)
-                return "".join(block.get("text", "") for block in answer.get("content", []) if block.get("type") == "text")
+                with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers), timeout=180) as r:
+                    return json.load(r)
             except urllib.error.HTTPError as exc:
                 if exc.code not in (429, 500, 502, 503, 529) or attempt == ATTEMPTS - 1:
                     # The key is in a header, never in the URL or the body, so the message is safe.

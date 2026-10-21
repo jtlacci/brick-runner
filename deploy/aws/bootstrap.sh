@@ -35,7 +35,7 @@ status() { ssm_put status String "$1"; say "status: $1"; }
 say "packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-apt-get install -y -q git python3-venv openssl unzip curl iproute2 nodejs npm
+apt-get install -y -q git python3-venv openssl unzip curl iproute2 nodejs npm xvfb
 if ! command -v aws >/dev/null; then
   curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscli.zip
   unzip -q /tmp/awscli.zip -d /tmp && /tmp/aws/install && rm -rf /tmp/aws /tmp/awscli.zip
@@ -60,6 +60,8 @@ python3 -m venv "$VENV"
 "$VENV/bin/pip" install -q "git+https://github.com/jtlacci/brick-runner.git@$RUNNER_REF"
 # Chromium for web bricks: root-owned and read-only to the service, outside its hidden home.
 PLAYWRIGHT_BROWSERS_PATH=/opt/brick-runner/browsers "$VENV/bin/playwright" install --with-deps chromium
+# Google Chrome (headed, on an Xvfb screen) is the browser web evaluations use: BRICK_RUNNER_BROWSER=chrome.
+"$VENV/bin/playwright" install --with-deps chrome
 chown -R root:root /opt/brick-runner
 
 # ---------------------------------------------------------------- the runner's signing key
@@ -141,6 +143,7 @@ BRICK_RUNNER_INSTALLATION_ID=$INSTALLATION_ID
 BRICK_RUNNER_APP_KEY=/run/credentials/brick-runner.service/app-key
 BRICK_RUNNER_JUDGE_KEY=/run/credentials/brick-runner.service/judge-key
 BRICK_RUNNER_BROWSERS=/opt/brick-runner/browsers
+BRICK_RUNNER_BROWSER=chrome
 AWS_DEFAULT_REGION=$REGION
 EOF
 chmod 600 /etc/brick-runner/env

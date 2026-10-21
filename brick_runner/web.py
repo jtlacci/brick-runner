@@ -12,7 +12,18 @@ in two steps:
    cache, then ``npm run build``. The build must write ``app/dist/``.
 
 The evaluator then serves ``dist/`` on 127.0.0.1 in its own sandbox and drives
-Chromium (see workers/evaluator.py, command ``observe``).
+a browser (see workers/evaluator.py, command ``observe``).
+
+Headers: ``app/headers.json`` may declare the security headers the app is
+served with in production ({"Content-Security-Policy": "...", ...}). The
+evaluation server sends the same headers, so a page that a policy breaks in
+production also breaks in the evaluation. Only the names in ALLOWED_HEADERS
+are accepted.
+
+Browser: BRICK_RUNNER_BROWSER picks it. ``chromium`` (the default) is
+Playwright's headless Chromium. ``chrome`` is Google Chrome, headed, on a
+virtual screen (Xvfb) inside the evaluator's sandbox: the browser people use,
+with real input events, focus and native dialogs.
 """
 
 from __future__ import annotations
@@ -29,6 +40,13 @@ from .sandbox import Sandbox, SandboxError
 APP = "app"
 DIST = "dist"
 BUILD_FOLDER = ".web-build"   # in the evaluation workspace: the built app, as data
+HEADERS_FILE = "headers.json"   # in app/: the headers the app is served with
+HEADERS_COPY = ".web-headers.json"   # in the evaluation workspace, beside BUILD_FOLDER
+ALLOWED_HEADERS = ("Content-Security-Policy", "X-Content-Type-Options", "Referrer-Policy", "Permissions-Policy",
+                   "X-Frame-Options", "Cross-Origin-Opener-Policy", "Cross-Origin-Embedder-Policy",
+                   "Cross-Origin-Resource-Policy")
+BROWSERS = ("chromium", "chrome")
+CHROME = Path("/opt/google/chrome/chrome")
 REGISTRY = "https://registry.npmjs.org/"
 
 
@@ -90,8 +108,47 @@ def prefetch(app: Path, cache: Path, timeout: float = 900) -> None:
             raise BuildError("npm prefetch failed", (done.stdout + done.stderr)[-6000:])
 
 
+def read_headers(app: Path) -> dict[str, str]:
+    """The headers app/headers.json declares; {} when there is no file."""
+    path = app / HEADERS_FILE
+    if not path.exists():
+        return {}
+    if path.is_symlink() or not path.is_file():
+        raise BuildError(f"{APP}/{HEADERS_FILE} must be a plain file")
+    try:
+        headers = json.loads(path.read_text())
+    except ValueError as exc:
+        raise BuildError(f"{APP}/{HEADERS_FILE} is not JSON: {exc}") from exc
+    allowed = {name.lower(): name for name in ALLOWED_HEADERS}
+    if not isinstance(headers, dict):
+        raise BuildError(f"{APP}/{HEADERS_FILE} must be an object of header names to values")
+    clean = {}
+    for name, value in headers.items():
+        if not isinstance(name, str) or name.lower() not in allowed:
+            raise BuildError(f"{APP}/{HEADERS_FILE}: {name!r} is not an allowed header ({', '.join(ALLOWED_HEADERS)})")
+        if not isinstance(value, str) or len(value) > 4000 or any(c in value for c in "\r\n"):
+            raise BuildError(f"{APP}/{HEADERS_FILE}: the value of {name} must be one line of text")
+        clean[allowed[name.lower()]] = value
+    return clean
+
+
+def browser_settings() -> dict[str, object]:
+    """The browser the evaluator starts: {"name", "headed", "executable"?}."""
+    name = os.environ.get("BRICK_RUNNER_BROWSER", "chromium")
+    if name not in BROWSERS:
+        raise BuildError(f"BRICK_RUNNER_BROWSER must be one of {', '.join(BROWSERS)}, not {name!r}")
+    if name == "chromium":
+        return {"name": "chromium", "headed": False}
+    if not CHROME.is_file():
+        raise BuildError(f"BRICK_RUNNER_BROWSER=chrome, and Google Chrome is not at {CHROME}")
+    xvfb = shutil.which("Xvfb")
+    if not xvfb:
+        raise BuildError("BRICK_RUNNER_BROWSER=chrome needs Xvfb for its virtual screen")
+    return {"name": "chrome", "headed": True, "executable": str(CHROME), "xvfb": xvfb}
+
+
 def toolchain() -> dict[str, str]:
-    """Versions that change a web evaluation: Node, npm, Playwright and its browsers."""
+    """Versions that change a web evaluation: Node, npm, Playwright, its browsers, and the browser used."""
     from importlib import metadata
 
     def version(command: list[str]) -> str:
@@ -105,8 +162,10 @@ def toolchain() -> dict[str, str]:
         playwright = metadata.version("playwright")
     except metadata.PackageNotFoundError:
         playwright = "missing"
+    browser = browser_settings()
+    used = (version([str(browser["executable"]), "--version"]) + " headed") if browser["name"] == "chrome" else "chromium headless"
     return {"node": version(["node", "--version"]), "npm": version(["npm", "--version"]),
-            "playwright": playwright,
+            "playwright": playwright, "browser": used,
             "browsers": ",".join(sorted(p.name for p in Path(browsers).iterdir())) if browsers and Path(browsers).is_dir() else ""}
 
 
@@ -123,6 +182,7 @@ def build(sandbox: Sandbox, code_root: Path, brick: str, into: Path, timeout: fl
         if links:
             raise BuildError("symlinks are not allowed in app/: " + ", ".join(p.name for p in links[:5]))
         shutil.copytree(source, work / APP, symlinks=True, ignore=shutil.ignore_patterns("node_modules", DIST))
+        headers = read_headers(source)
         prefetch(work / APP, work / ".npm-cache")
         script = ("cd app && npm ci --offline --no-audit --no-fund --cache ../.npm-cache "
                   "&& npm run build")
@@ -142,4 +202,5 @@ def build(sandbox: Sandbox, code_root: Path, brick: str, into: Path, timeout: fl
         for path in list(into.rglob("*")):
             if path.is_symlink():
                 path.unlink()
+        (into.parent / HEADERS_COPY).write_text(json.dumps(headers))
         return log

@@ -164,3 +164,22 @@ class MutateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SandboxTmpTests(unittest.TestCase):
+    def test_tmp_is_private_and_writable(self) -> None:
+        from brick_runner.sandbox import Sandbox, isolation
+        if not isolation():
+            self.skipTest("this host cannot create namespaces")
+        planted = Path("/tmp") / "brick-runner-host-secret"
+        planted.write_text("host")
+        work = Path(tempfile.mkdtemp(prefix="brick-tmp-"))
+        try:
+            code, log = Sandbox([]).run_command(
+                ["sh", "-c", "ls -A /tmp; echo ok > /tmp/mine && cat /tmp/mine"], work, timeout=60)
+            self.assertEqual(code, 0, log)
+            self.assertNotIn(planted.name, log)
+            self.assertIn("ok", log)
+        finally:
+            planted.unlink()
+            shutil.rmtree(work, ignore_errors=True)

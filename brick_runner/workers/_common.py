@@ -23,7 +23,9 @@ def start(armed: bool = True) -> tuple[dict[str, Any], Any]:
     ``armed=False`` lets a worker start its own tools first (a local server, a
     browser); it must call ``arm()`` before any code under evaluation runs.
     """
-    payload = json.loads(sys.stdin.read())
+    # One line: a one-shot worker gets its payload and then end of input; a
+    # worker with a conversation (observe with an agent) reads later lines.
+    payload = json.loads(sys.stdin.readline())
     result_stream = os.fdopen(os.dup(1), "w", encoding="utf-8")
     sys.stdout = sys.stderr  # anything the code under evaluation prints goes to the log
     if armed:

@@ -16,9 +16,11 @@ import secrets
 import shutil
 import statistics
 import tempfile
+import time
 from typing import Any, Iterator
 
 from . import broker, mutate, splits, web, workspace
+from .agent import AgentError, Agents
 from .gitrepo import Repo
 from .hashing import canonical, digest
 from .judge import MAX_REQUESTS_PER_CASE, MAX_REQUESTS_PER_EVALUATION, Judge, JudgeError
@@ -33,6 +35,8 @@ DEFECT_STRENGTHS = (1, 2, 4)
 DEFECT_SEEDS = (0, 1, 2, 3)
 OPERATORS = {">=": lambda a, b: a >= b, "<=": lambda a, b: a <= b, ">": lambda a, b: a > b, "<": lambda a, b: a < b}
 LOG_LIMIT = 4000
+OBSERVE_TIMEOUT = 3 * 3600   # a web evaluation with agent sessions can take long
+NO_AGENT_KINDS = ("defect-baseline", "defect-mutant")   # the defect check runs no agent case
 
 
 class RunnerError(RuntimeError):
@@ -203,7 +207,7 @@ class Runner:
                     envelope = self.ledger.envelope(hits[0].run_id)
                     envelope["cached"] = True
                     return envelope
-            envelope = self._execute(brick, ws, policy, chosen, base)
+            envelope = self._execute(brick, ws, policy, chosen, base, agent=kind not in NO_AGENT_KINDS)
             envelope.update({"eval_id": eval_id, "identity": identity, "split": split, "brick": brick,
                              "time": now(), "sandboxed": not self.sandbox.unsandboxed,
                              "synthetic": load_lock(self.repo, base, brick) == "unpinned"})
@@ -220,7 +224,8 @@ class Runner:
             if own:
                 ws.cleanup()
 
-    def _execute(self, brick: str, ws: Workspace, policy: Policy, records: list[dict[str, Any]], base: str) -> dict[str, Any]:
+    def _execute(self, brick: str, ws: Workspace, policy: Policy, records: list[dict[str, Any]], base: str,
+                 agent: bool = True) -> dict[str, Any]:
         counts = {"cases": len(records), "build_errors": 0, "out_of_evidence": 0, "run_errors": 0,
                   "score_errors": 0, "determinism_mismatches": 0, "regenerated": 0, "scored": 0}
         examples: list[dict[str, Any]] = []
@@ -230,6 +235,11 @@ class Runner:
         if not all(isinstance(g, list) and len(g) == 3 and isinstance(g[0], str) and g[1] in OPERATORS
                    and isinstance(g[2], (int, float)) and not isinstance(g[2], bool) for g in gates):
             raise RunnerError("GATES must be a tuple of (term, operator, threshold)")
+        declared_agent = declared.get("agent")
+        skipped_agent = 0
+        if declared_agent and not agent:
+            # The defect check: no agent case runs, and the gates only agent cases give are left out.
+            gates = [g for g in gates if g[0] not in set(declared_agent["terms"])]
         if not gates:
             reasons.append("evaluate.py declares no GATES")
         built = self._evaluator(ws, {"command": "build", "records": records})["inputs"]
@@ -239,11 +249,17 @@ class Runner:
                 counts["build_errors"] += 1
                 examples.append({"record": record["id"], "stage": "build", "error": item["error"]})
                 continue
+            if declared_agent and not agent and isinstance(item["input"], dict) and "task" in item["input"]:
+                skipped_agent += 1
+                continue
             cases.append({"input": item["input"], "exchanges": record["exchanges"]})
             kept.append(record)
+        if skipped_agent:
+            counts["agent_cases_skipped"] = skipped_agent
+        agents = Agents(self.judge, declared_agent["model"]) if declared_agent and agent else None
         try:
             if self.kind(base, brick) == "web":
-                results, log = self._run_web(brick, ws, cases)
+                results, log = self._run_web(brick, ws, cases, agents)
             else:
                 results, log = broker.run_cases(self.sandbox, brick, ws.code, ws.deps,
                                                 functools.partial(self._deterministic, base), cases)
@@ -255,6 +271,13 @@ class Runner:
             return {"passed": False, "terms": {}, "gates": [], "counts": counts, "fatal": str(exc),
                     "reasons": [f"the candidate worker failed: {exc}"], "counterexamples": examples,
                     "log": exc.log[-LOG_LIMIT:]}
+        except AgentError as exc:
+            counts.update(agents.usage() if agents else {})
+            return {"passed": False, "terms": {}, "gates": [], "counts": counts, "fatal": str(exc),
+                    "reasons": [f"the computer use agent failed: {exc}"], "counterexamples": examples,
+                    "log": ""}
+        if agents:
+            counts.update(agents.usage())
         items, outcomes = [], []
         for record, result in zip(kept, results):
             counts["determinism_mismatches"] += result["mismatches"]
@@ -315,17 +338,40 @@ class Runner:
         return {"passed": not reasons, "terms": means, "gates": gate_results, "counts": counts,
                 "reasons": reasons, "counterexamples": examples[:50], "log": log[-LOG_LIMIT:]}
 
-    def _run_web(self, brick: str, ws: Workspace, cases: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
-        """Build the candidate's app in the sandbox, then let evaluate.observe() look at it in Chromium."""
+    def _run_web(self, brick: str, ws: Workspace, cases: list[dict[str, Any]],
+                 agents: Agents | None = None) -> tuple[list[dict[str, Any]], str]:
+        """Build the candidate's app in the sandbox, then let evaluate.observe() look at it in a browser."""
         log = web.build(self.sandbox, ws.code, brick, ws.evaluation / web.BUILD_FOLDER)
         if not cases:
             return [], log
-        observed = self._evaluator(ws, {"command": "observe", "inputs": [c["input"] for c in cases]})["observations"]
+        observed, observe_log = self._observe(ws, [c["input"] for c in cases], agents)
         results = []
         for item in observed:
             result = {"output": item["output"]} if "output" in item else {"error": item.get("error", "no observation")}
             results.append({**result, "mismatches": 0, "regenerated": 0})
-        return results, log
+        return results, log + observe_log
+
+    def _observe(self, ws: Workspace, inputs: list[Any], agents: Agents | None) -> tuple[list[dict[str, Any]], str]:
+        """The observe command, over a line channel: the worker may ask for agent steps before its result."""
+        workspace.verify_evaluation(self.repo, ws)
+        worker = self.sandbox.start("evaluator.py", ws.evaluation)
+        deadline = time.monotonic() + OBSERVE_TIMEOUT
+        try:
+            worker.send({"brick": ws.target, "command": "observe", "inputs": inputs,
+                         "browser": web.browser_settings(), "agent": agents is not None})
+            while True:
+                message = worker.receive(deadline)
+                if message.get("op") == "result":
+                    if "fatal" in message:
+                        raise SandboxError(f"evaluator.py failed: {message['fatal']}", worker.log_text())
+                    return message["observations"], worker.log_text()
+                if message.get("op") == "agent":
+                    reply = agents.step(message) if agents else {"error": "this evaluation runs no agent"}
+                    worker.send(reply)
+                else:
+                    worker.send({"error": f"unknown request {message.get('op')!r}"})
+        finally:
+            worker.stop()
 
     def _judge(self, ws: Workspace, items: list[dict[str, Any]], counts: dict[str, int],
                examples: list[dict[str, Any]]) -> None:

@@ -8,7 +8,8 @@ Each worker runs in new user, network and mount namespaces:
   repository are hidden behind empty private tmpfs mounts, so a worker cannot
   read the signing key, the store, the ledger or another worker's workspace;
 - every other mount, including the runner's own source and the Python
-  environment, is remounted read-only, so a worker cannot change the host.
+  environment, is remounted read-only, so a worker cannot change the host;
+- then /tmp is a new, empty, writable tmpfs of its own (for tools such as Xvfb).
 
 The workers also install an audit hook that refuses sockets and subprocesses.
 Without namespaces the runner refuses to run, unless BRICK_RUNNER_UNSANDBOXED=1
@@ -63,6 +64,10 @@ awk '{o[$2]=$4} END {for (m in o) print m, o[m]}' /proc/self/mounts | while read
   done
   mount -o "remount,bind,ro$keep" "$m" 2>/dev/null || { echo "sandbox: cannot make $m read-only" >&2; exit 97; }
 done
+# A new, empty /tmp that the worker can write: some tools have no other place
+# (Xvfb puts its lock file and socket there). It is private to this worker and
+# shows nothing of the host's /tmp.
+mount -t tmpfs -o size=16m,mode=1777,nosuid,nodev tmpfs /tmp
 # A new network namespace has only a loopback interface, and it is down.
 # Builds and browser evaluations serve pages on 127.0.0.1, so start it.
 # Without iproute2, set IFF_UP with the SIOCGIFFLAGS and SIOCSIFFLAGS ioctls.

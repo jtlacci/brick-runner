@@ -23,7 +23,8 @@ Every worker runs in new user, network and mount namespaces (`unshare`):
 - no network;
 - its own tree, mounted at `/mnt`;
 - `/tmp`, `/dev/shm`, `/var/tmp`, the runner's state folder and the brick repository are hidden behind empty private mounts, so a worker cannot read the signing key, the store, the ledger or another worker's tree;
-- every other mount is read-only, including the runner's own source and the Python environment, so a worker cannot change the host.
+- every other mount is read-only, including the runner's own source and the Python environment, so a worker cannot change the host;
+- then `/tmp` is a new, empty, writable tmpfs of the worker's own (Xvfb needs it).
 
 An audit hook also refuses sockets and subprocesses. On a host without namespaces the runner refuses to evaluate, unless `BRICK_RUNNER_UNSANDBOXED=1` is set for development; results then say `"sandboxed": false`.
 
@@ -126,7 +127,13 @@ A brick with `KIND = "web"` is a browser app in `app/`. For each evaluation the 
 
 1. checks `app/package-lock.json` (every package from registry.npmjs.org, with a sha512 integrity hash) and fills an npm cache **outside** the sandbox, with only `package.json` and the lockfile and no install scripts;
 2. runs `npm ci --offline` and `npm run build` **inside** the sandbox, with no network;
-3. copies `app/dist/` into the evaluation workspace as data, serves it on 127.0.0.1 in the evaluator's sandbox, starts Chromium, and calls `evaluate.observe(input, browser, base_url)` for each case. `score()` then scores what `observe` saw.
+3. copies `app/dist/` into the evaluation workspace as data, serves it on 127.0.0.1 in the evaluator's sandbox with the headers in `app/headers.json`, starts the browser, and calls `evaluate.observe(input, browser, base_url)` for each case. `score()` then scores what `observe` saw.
+
+**Headers.** `app/headers.json` (`{"Content-Security-Policy": "...", ...}`) declares the security headers the app has in production. The evaluation server sends the same headers, so a page that a policy breaks in production breaks in the evaluation too. Let the production server read the same file. Only these names are allowed: `Content-Security-Policy`, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`, `X-Frame-Options` and the three `Cross-Origin-*` policies.
+
+**Browser.** `BRICK_RUNNER_BROWSER=chrome` runs Google Chrome, headed, on an Xvfb screen in the evaluator's sandbox: the browser people use, with real input events, focus and native dialogs. `chromium` (the default) is Playwright's headless Chromium. The browser and its version are part of the evaluation ID.
+
+**Computer use agent.** An `evaluate.py` with `AGENT = {"model": ..., "terms": [...]}` and `observe(input, browser, base_url, agent=None)` can give a case a task for a model that clicks through the app, as a person does: `agent.run(page, task, files=...)` returns `{"status": "done" | "failed" | "error", "text", "steps", "actions", "pickers"}`. The evaluator sends screenshots over its line channel; the runner, outside the sandbox, asks the model for the next actions with the computer use toolset (`computer_toolset_20260801`) and the judge key; the evaluator does them on the page with real mouse and keyboard events. A file picker that the page opens gets the task's `files`. The model does the task only: `score()` decides from facts, such as the requests the app sent. A case is an agent case when its input has `"task"`. The defect check runs no agent case and leaves out the gates on `AGENT["terms"]`, because each mutant would pay for every session again. Limits: 40 steps a task, 120 sessions and 2,500 calls an evaluation; only the newest 3 screenshots stay in a conversation. Agent answers are not cached; a whole evaluation is (by its ID), so a rerun of the same change costs nothing.
 
 The defect check mutates the app's JavaScript and TypeScript in `app/src/` (operators, booleans, numbers, strings), rebuilds and observes each mutant. A mutant that no longer builds counts as caught.
 
@@ -134,7 +141,7 @@ The defect check mutates the app's JavaScript and TypeScript in `app/src/` (oper
 
 An `evaluate.py` with `JUDGE = {"model": ...}` and `judge_requests(record, output)` gets model judgements: the runner, outside the sandbox, sends each request to the Anthropic Messages API with the key in `BRICK_RUNNER_JUDGE_KEY` (a file), caches each answer by request in `<home>/judgments/`, and calls `score(..., judgments=[...])`. Without a key, an evaluation that needs the judge fails with that reason.
 
-Setup: `npm` on the runner's PATH, and Chromium from `playwright install --with-deps chromium` in a folder the service can read, named by `BRICK_RUNNER_BROWSERS`.
+Setup: `npm` on the runner's PATH, and Chromium from `playwright install --with-deps chromium` in a folder the service can read, named by `BRICK_RUNNER_BROWSERS`. For `BRICK_RUNNER_BROWSER=chrome`: `playwright install --with-deps chrome` (Google Chrome in `/opt/google/chrome`) and the `xvfb` package.
 
 ## Limits
 
@@ -146,6 +153,8 @@ Setup: `npm` on the runner's PATH, and Chromium from `playwright install --with-
 - The brick repository's third-party dependencies must be installed in the runner's Python environment. The environment lock file is pinned in the evaluation ID, but the runner does not install it.
 - The candidate's web app runs in Chromium in the same sandbox as the evaluator, with Chromium's own sandbox off. A Chromium exploit could change the observation. Measure what matters from outside the page (Playwright and DevTools), not from values the page reports.
 - A judge prompt contains the output under evaluation, so a candidate can try to talk the judge into a high score. Keep hard gates on checks that need no judge.
+- The agent sees the candidate's page, so a page can show text that tries to steer it. The agent only drives the page in the sandbox, and the score comes from facts, so the worst a page can do is make its own task fail.
+- Agent cases are not part of the defect check. Their gates show what a person can do with the app; the defect check shows that the other gates can fail.
 - Selection is `best` only. Score correction for many trials is later work; the ledger keeps every trial, so it can be applied to old epochs.
 
 ## Tests
