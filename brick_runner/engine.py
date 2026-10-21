@@ -698,7 +698,13 @@ class Runner:
                                                           "unbuildable": unbuildable[strength],
                                                           "detected": detected, "of": len(values)}
                 medians = [report["strengths"][str(s)]["median"] for s in DEFECT_STRENGTHS]
-                monotonic = all(b <= a + tolerance for a, b in zip(medians, medians[1:]))
+                shares = [report["strengths"][str(s)]["detected"] / max(1, report["strengths"][str(s)]["of"])
+                          for s in DEFECT_STRENGTHS]
+                # "Scores fall as defects grow": the medians fall, or the share of mutants caught
+                # grows. With few mutants for each strength, one mutant that breaks many cases
+                # moves a median a lot, so either measure is enough.
+                monotonic = (all(b <= a + tolerance for a, b in zip(medians, medians[1:]))
+                             or all(b >= a for a, b in zip(shares, shares[1:])))
                 strongest = report["strengths"][str(DEFECT_STRENGTHS[-1])]
                 below = medians[-1] < base_value - tolerance
                 enough = strongest["detected"] * 2 >= strongest["of"]

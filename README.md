@@ -101,7 +101,7 @@ Credentials are never written into a config file: DVC reads the usual AWS variab
 
 `promote` needs a signed passing holdout whose component hashes still match the current base; otherwise it stops, and a human decides whether to grant a new holdout run. It runs the defect check if the epoch has none, and evaluates every direct dependent with the candidate. If any check fails, production does not change. A bundle whose holdout used synthetic data says `"synthetic": true`: the dev agent can read `generate()`, so that holdout is not hidden. Use shadow or paper mode to collect real data before you rely on it.
 
-**Evaluation loop.** `evaluation-change` runs the defect check: seeded mutations of the production code (`src/` and `input/adapters/`) at strengths 1, 2 and 4. The candidate evaluation passes only when scores fall as defects grow, and the strongest defects are detected. It also scores production under the old and the new evaluation. A human approves the change; when it merges, a new epoch starts.
+**Evaluation loop.** `evaluation-change` runs the defect check: seeded mutations of the production code (`src/` and `input/adapters/`) at strengths 1, 2 and 4. The candidate evaluation passes only when scores fall as defects grow (the median scores fall, or the share of mutants caught grows: with 4 mutants for each strength, one mutant that breaks many cases moves a median a lot), the median at the strongest level is below the baseline, at least half of the strongest mutants are caught, and most mutants build. It also scores production under the old and the new evaluation. A human approves the change; when it merges, a new epoch starts.
 
 An **epoch** is the Git tree hash of `bricks/<brick>/evaluation/` on the base.
 
