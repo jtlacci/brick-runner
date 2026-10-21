@@ -144,6 +144,8 @@ BRICK_RUNNER_APP_KEY=/run/credentials/brick-runner.service/app-key
 BRICK_RUNNER_JUDGE_KEY=/run/credentials/brick-runner.service/judge-key
 BRICK_RUNNER_BROWSERS=/opt/brick-runner/browsers
 BRICK_RUNNER_BROWSER=chrome
+# One observe worker (and browser) per vCPU, less one for the runner.
+BRICK_RUNNER_WEB_WORKERS=$(( $(nproc) > 1 ? $(nproc) - 1 : 1 ))
 AWS_DEFAULT_REGION=$REGION
 EOF
 chmod 600 /etc/brick-runner/env

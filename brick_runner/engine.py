@@ -16,6 +16,7 @@ import secrets
 import shutil
 import statistics
 import tempfile
+import threading
 import time
 from typing import Any, Iterator
 
@@ -361,9 +362,51 @@ class Runner:
         return results, log + observe_log
 
     def _observe(self, ws: Workspace, inputs: list[Any], agents: Agents | None) -> tuple[list[dict[str, Any]], str]:
-        """The observe command, over a line channel: the worker may ask for agent steps before its result."""
+        """observe over BRICK_RUNNER_WEB_WORKERS evaluator workers, each with its own browser.
+
+        Case i goes to worker i mod n, so slow cases (scrolling, agent tasks)
+        spread over the workers. The observations come back in case order.
+        """
         workspace.verify_evaluation(self.repo, ws)
+        count = max(1, min(web.workers(), len(inputs)))
+        if count == 1:
+            return self._observe_one(ws, inputs, agents, "", [])
+        chunks = [list(range(i, len(inputs), count)) for i in range(count)]
+        started: list[Any] = []   # every worker process, so a failure can stop the others
+        results: list[Any] = [None] * count
+        errors: list[BaseException] = []
+
+        def work(index: int) -> None:
+            if errors:
+                return   # another worker already failed
+            try:
+                results[index] = self._observe_one(ws, [inputs[i] for i in chunks[index]], agents, f"w{index}.", started)
+            except BaseException as exc:  # noqa: BLE001 -- passed to the caller below
+                errors.append(exc)
+                for process in list(started):
+                    process.stop()
+
+        threads = [threading.Thread(target=work, args=(i,), daemon=True) for i in range(count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if errors:
+            first = next((e for e in errors if isinstance(e, AgentError)), errors[0])
+            raise first
+        observations: list[Any] = [None] * len(inputs)
+        logs = []
+        for index, (observed, log) in enumerate(results):
+            for case, observation in zip(chunks[index], observed):
+                observations[case] = observation
+            logs.append(log)
+        return observations, "".join(logs)
+
+    def _observe_one(self, ws: Workspace, inputs: list[Any], agents: Agents | None, prefix: str,
+                     started_list: list[Any]) -> tuple[list[dict[str, Any]], str]:
+        """One worker's observe, over a line channel: the worker may ask for agent steps before its result."""
         worker = self.sandbox.start("evaluator.py", ws.evaluation)
+        started_list.append(worker)
         started = time.monotonic()
         deadline = started + OBSERVE_TIMEOUT
         try:
@@ -380,6 +423,8 @@ class Runner:
                         raise SandboxError("evaluator.py gave no observation for each case", worker.log_text())
                     return observations, worker.log_text()
                 if message.get("op") == "agent":
+                    if isinstance(message.get("session"), str):
+                        message["session"] = prefix + message["session"]   # names are per worker
                     reply = agents.step(message) if agents else {"error": "this evaluation runs no agent"}
                     if agents:
                         deadline = min(deadline + AGENT_STEP_TIME, started + OBSERVE_TIMEOUT_MAX)

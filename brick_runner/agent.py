@@ -22,6 +22,7 @@ mutant would pay for every session again.
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any
 
 from .judge import Judge, JudgeError
@@ -74,6 +75,10 @@ class Agents:
         self.calls = 0
         self.input_tokens = 0
         self.output_tokens = 0
+        # Parallel workers call step() from their own threads. The lock keeps the
+        # session table and the evaluation-wide counters right; one session is
+        # only ever used by one worker.
+        self._lock = threading.Lock()
 
     def step(self, message: dict[str, Any]) -> dict[str, Any]:
         """One worker message -> the next actions, or the end of the session."""
@@ -83,17 +88,19 @@ class Agents:
         name = message.get("session")
         if not isinstance(name, str) or not name or len(name) > 64:
             return {"error": "a session needs a name"}
-        session = self.sessions.get(name)
-        if session is None:
-            if len(self.sessions) >= MAX_SESSIONS_PER_EVALUATION:
-                raise AgentError(f"more than {MAX_SESSIONS_PER_EVALUATION} agent sessions in one evaluation")
-            task = message.get("task")
-            if not isinstance(task, str) or not task.strip() or len(task) > 4000:
-                return {"error": "an agent session starts with a task"}
-            if len(results) != 1 or not isinstance(results[0].get("image"), str):
-                return {"error": "an agent session starts with one screenshot"}
-            session = {"messages": [], "steps": 0, "pending": set(), "closed": False}
-            self.sessions[name] = session
+        with self._lock:
+            session = self.sessions.get(name)
+            if session is None:
+                task = message.get("task")
+                if not isinstance(task, str) or not task.strip() or len(task) > 4000:
+                    return {"error": "an agent session starts with a task"}
+                if len(results) != 1 or not isinstance(results[0].get("image"), str):
+                    return {"error": "an agent session starts with one screenshot"}
+                if len(self.sessions) >= MAX_SESSIONS_PER_EVALUATION:
+                    raise AgentError(f"more than {MAX_SESSIONS_PER_EVALUATION} agent sessions in one evaluation")
+                session = {"messages": [], "steps": 0, "pending": set(), "closed": False, "new": True}
+                self.sessions[name] = session
+        if session.pop("new", False):
             session["messages"].append({"role": "user", "content": [{"type": "text", "text": task},
                                                                      _image(results[0]["image"])]})
         else:
@@ -105,10 +112,12 @@ class Agents:
             session["messages"].append({"role": "user", "content": [_tool_result(r) for r in results]})
         if session["steps"] >= MAX_STEPS_PER_SESSION:
             return self._close(session, f"limit: more than {MAX_STEPS_PER_SESSION} steps in one task")
-        if self.calls >= MAX_CALLS_PER_EVALUATION:
-            raise AgentError(f"more than {MAX_CALLS_PER_EVALUATION} agent calls in one evaluation")
-        if self.input_tokens >= MAX_INPUT_TOKENS_PER_EVALUATION or self.output_tokens >= MAX_OUTPUT_TOKENS_PER_EVALUATION:
-            raise AgentError("the agent token budget for one evaluation is used up")
+        with self._lock:
+            if self.calls >= MAX_CALLS_PER_EVALUATION:
+                raise AgentError(f"more than {MAX_CALLS_PER_EVALUATION} agent calls in one evaluation")
+            if self.input_tokens >= MAX_INPUT_TOKENS_PER_EVALUATION or self.output_tokens >= MAX_OUTPUT_TOKENS_PER_EVALUATION:
+                raise AgentError("the agent token budget for one evaluation is used up")
+            self.calls += 1   # counted before the call, so parallel workers cannot pass the limit
         _keep_newest_images(session["messages"], KEEP_IMAGES)
         body = {"model": self.model, "max_tokens": MAX_TOKENS, "system": SYSTEM, "tools": [TOOLSET],
                 "messages": session["messages"]}
@@ -116,11 +125,11 @@ class Agents:
             answer = self.judge.post(body)
         except JudgeError as exc:
             raise AgentError(str(exc), transient=exc.transient) from None
-        self.calls += 1
         session["steps"] += 1
         usage = answer.get("usage") if isinstance(answer.get("usage"), dict) else {}
-        self.input_tokens += int(usage.get("input_tokens", 0) or 0)
-        self.output_tokens += int(usage.get("output_tokens", 0) or 0)
+        with self._lock:
+            self.input_tokens += int(usage.get("input_tokens", 0) or 0)
+            self.output_tokens += int(usage.get("output_tokens", 0) or 0)
         content = answer.get("content") if isinstance(answer.get("content"), list) else []
         stop = answer.get("stop_reason")
         if stop not in (None, "tool_use", "end_turn", "stop_sequence"):

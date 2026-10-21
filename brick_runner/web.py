@@ -148,6 +148,17 @@ def browser_settings() -> dict[str, object]:
     return {"name": "chrome", "headed": True, "executable": str(CHROME), "xvfb": xvfb}
 
 
+def workers() -> int:
+    """How many evaluator workers (each with its own browser) observe at once: BRICK_RUNNER_WEB_WORKERS."""
+    try:
+        count = int(os.environ.get("BRICK_RUNNER_WEB_WORKERS", "1"))
+    except ValueError:
+        raise BuildError("BRICK_RUNNER_WEB_WORKERS must be a number") from None
+    if not 1 <= count <= 16:
+        raise BuildError("BRICK_RUNNER_WEB_WORKERS must be from 1 to 16")
+    return count
+
+
 def toolchain() -> dict[str, str]:
     """Versions that change a web evaluation: Node, npm, Playwright, its browsers, and the browser used."""
     from importlib import metadata
@@ -175,6 +186,8 @@ def toolchain() -> dict[str, str]:
                                       ("agent.py", "workers/_agent.py", "workers/evaluator.py"))).hexdigest()[:16]
     return {"node": version(["node", "--version"]), "npm": version(["npm", "--version"]),
             "playwright": playwright, "browser": used, "harness": harness,
+            # Workers share the CPU, so their number changes timings: it is part of the ID.
+            "workers": os.environ.get("BRICK_RUNNER_WEB_WORKERS", "1"),
             "browsers": ",".join(sorted(p.name for p in Path(browsers).iterdir())) if browsers and Path(browsers).is_dir() else ""}
 
 

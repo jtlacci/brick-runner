@@ -543,6 +543,38 @@ class WebScenario(unittest.TestCase):
             FakeAgent.mode = "ok"
             server.shutdown()
 
+    def test_17_parallel_workers_keep_case_order(self) -> None:
+        server, env = self._agent_env()
+        FakeAgent.mode = "ok"
+        try:
+            commit = self.branch("agent-parallel", {**AGENT_APP, "bricks/web/app/src/main.js": AGENT_APP["bricks/web/app/src/main.js"] + "// parallel\n"})
+            base = self.runner.repo.commit(commit)
+            with mock.patch.dict(os.environ, {**env, "BRICK_RUNNER_WEB_WORKERS": "3"}):
+                result = self.runner.evaluate("web", "development", [], base=base, cache=False)
+            # A task case scored with another case's observation would fail or raise in score().
+            self.assertTrue(result["passed"], result)
+            self.assertEqual(result["counts"]["score_errors"], 0)
+            self.assertGreater(result["counts"]["agent_sessions"], 1)
+            self.assertEqual(result["identity"]["toolchain"]["workers"], "3")
+            with mock.patch.dict(os.environ, {**env, "BRICK_RUNNER_WEB_WORKERS": "0"}):
+                bad = self.runner.evaluate("web", "development", [], base=base, cache=False)
+            self.assertFalse(bad["passed"])
+            self.assertIn("BRICK_RUNNER_WEB_WORKERS", " ".join(bad["reasons"]))
+        finally:
+            server.shutdown()
+
+    def test_18_sessions_from_two_workers_do_not_mix(self) -> None:
+        from brick_runner.agent import Agents
+
+        class Judge:
+            def post(self, body):
+                return {"content": [{"type": "tool_use", "id": "a1", "name": "screenshot", "input": {}}]}
+
+        agents = Agents(Judge(), "claude-sonnet-5-5")
+        for worker in ("w0.", "w1."):
+            self.assertIn("actions", agents.step({"session": worker + "s0", "task": "t", "results": [{"image": "x"}]}))
+        self.assertEqual(len(agents.sessions), 2)
+
     @unittest.skipUnless(HAS_CHROME, "Google Chrome and Xvfb are needed")
     def test_16_a_killed_worker_leaves_no_x_server(self) -> None:
         import subprocess as sp
