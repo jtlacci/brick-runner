@@ -504,7 +504,8 @@ class Runner:
                examples: list[dict[str, Any]]) -> None:
         """Ask the pinned judge model for each request evaluate.judge_requests() makes."""
         made = self._evaluator(ws, {"command": "judge_requests",
-                                    "items": [{"record": i["record"], "output": i["output"]} for i in items]})
+                                    "items": [{"record": i["record"], "output": i["output"], "calls": i.get("calls", [])}
+                                              for i in items]})
         model = made["judge"]["model"]
         counts.setdefault("judge_errors", 0)
         before = self.judge.calls

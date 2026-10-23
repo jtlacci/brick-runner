@@ -160,3 +160,30 @@ class LiveHermesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JudgeCallsTest(unittest.TestCase):
+    """judge_requests(record, output, calls) sees the case's calls; the two-argument form still works."""
+
+    def run_judge(self, source: str) -> dict:
+        from brick_runner.sandbox import Sandbox
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "bricks" / "x" / "evaluation"
+            folder.mkdir(parents=True)
+            (folder / "evaluate.py").write_text(source)
+            result, _ = Sandbox(hide=[]).run("evaluator.py", Path(tmp), {
+                "command": "judge_requests", "brick": "x",
+                "items": [{"record": {"id": "r"}, "output": {}, "calls": [{"name": "external:hermes"}]}]})
+            return result
+
+    def test_calls_reach_judge_requests(self) -> None:
+        result = self.run_judge('JUDGE = {"model": "m"}\n'
+                                'def judge_requests(record, output, calls=()):\n'
+                                '    return [{"prompt": str(len(calls))}]\n')
+        self.assertEqual(result["requests"], [[{"prompt": "1"}]])
+
+    def test_two_argument_form(self) -> None:
+        result = self.run_judge('JUDGE = {"model": "m"}\n'
+                                'def judge_requests(record, output):\n'
+                                '    return [{"prompt": "ok"}]\n')
+        self.assertEqual(result["requests"], [[{"prompt": "ok"}]])

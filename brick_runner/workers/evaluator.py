@@ -20,7 +20,7 @@ Commands (stdin {"command", "brick", ...}):
             observe speaks one JSON object per line: {"op": "agent", ...}
             asks the runner for a computer use step (see _agent.py), and
             {"op": "result", ...} ends it.
-- judge_requests: {"items": [{"record", "output"}]}
+- judge_requests: {"items": [{"record", "output", "calls"}]} (calls only when judge_requests() takes them)
             -> {"judge": JUDGE, "requests": [[request, ...] | {"error"}]}
             The runner, outside the sandbox, sends each request to the pinned
             judge model; score() then gets the answers as ``judgments``.
@@ -219,10 +219,16 @@ def main() -> None:
         if not isinstance(judge, dict) or not isinstance(judge.get("model"), str):
             finish(stream, {"fatal": "judge_requests() needs JUDGE = {\"model\": \"<model id>\"}"})
             return
+        import inspect
+        try:
+            takes_calls = "calls" in inspect.signature(module.judge_requests).parameters
+        except (TypeError, ValueError):
+            takes_calls = False
         requests = []
         for item in payload["items"]:
             try:
-                made = [dict(r) for r in module.judge_requests(item["record"], item["output"])]
+                extra = {"calls": item.get("calls", [])} if takes_calls else {}
+                made = [dict(r) for r in module.judge_requests(item["record"], item["output"], **extra)]
                 json.dumps(made)
                 requests.append(made)
             except Exception:
