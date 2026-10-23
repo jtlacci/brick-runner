@@ -36,6 +36,7 @@ class CaseState:
     out_of_evidence: bool = False
     mismatches: int = 0
     regenerated: int = 0
+    fixture: Any = None   # the case's _fixture, for a live Hermes answer
 
     @classmethod
     def from_exchanges(cls, exchanges: list[dict[str, Any]]) -> "CaseState":
@@ -106,7 +107,7 @@ class Broker:
         if record is None and self.live is not None and message.get("name") in self.live.names:
             from .live import LiveError
             try:
-                response = self.live.answer(str(message.get("name")), message.get("request"))
+                response = self.live.answer(str(message.get("name")), message.get("request"), state.fixture)
             except LiveError as exc:
                 if exc.transient or exc.fatal:
                     raise   # the evaluation stops: an outage is retried, a used-up budget fails the run
@@ -161,6 +162,7 @@ def run_cases(sandbox: Sandbox, brick: str, candidate: Path, dependencies: Path,
     try:
         for case in cases:
             state = CaseState.from_exchanges(case["exchanges"])
+            state.fixture = case.get("fixture")
             result = broker.run_case(worker, case["input"], state)
             if state.out_of_evidence:
                 result = {"out_of_evidence": True}

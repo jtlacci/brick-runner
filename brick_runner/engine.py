@@ -298,7 +298,8 @@ class Runner:
             if declared_agent and not agent and isinstance(item["input"], dict) and "task" in item["input"]:
                 skipped_agent += 1
                 continue
-            cases.append({"input": item["input"], "exchanges": record["exchanges"]})
+            fixture = record["input"].get("_fixture") if isinstance(record.get("input"), dict) else None
+            cases.append({"input": item["input"], "exchanges": record["exchanges"], "fixture": fixture})
             kept.append(record)
         if skipped_agent:
             counts["agent_cases_skipped"] = skipped_agent
@@ -307,7 +308,8 @@ class Runner:
         try:
             if policy.live_externals:
                 live = Live(self.judge, policy.live_externals, self.home / "live",
-                            max_calls=budget.get("max_model_calls"), max_tokens=budget.get("max_model_tokens"))
+                            max_calls=budget.get("max_model_calls"), max_tokens=budget.get("max_model_tokens"),
+                            sandbox=self.sandbox, evaluate_py=ws.evaluation / "bricks" / brick / "evaluation" / "evaluate.py")
             if declared_agent and agent:
                 agents = Agents(self.judge, declared_agent["model"], max_calls=budget.get("max_agent_calls"),
                                 max_tokens=budget.get("max_agent_tokens"))
@@ -338,6 +340,9 @@ class Runner:
             return {"passed": False, "terms": {}, "gates": [], "counts": counts, "fatal": str(exc),
                     "reasons": [f"the computer use agent failed: {exc}"], "counterexamples": examples,
                     "log": ""}
+        finally:
+            if live:
+                live.close()   # stops a Hermes driver, if one ran
         if agents:
             counts.update(agents.usage())
         if live:
