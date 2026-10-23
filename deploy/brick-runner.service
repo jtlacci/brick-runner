@@ -31,6 +31,9 @@ NoNewPrivileges=yes
 ProtectSystem=full
 StateDirectory=brick-runner
 StateDirectoryMode=0700
+# Hermes installs for live_externals: [hermes] (code only; workers may read it).
+CacheDirectory=brick-runner
+CacheDirectoryMode=0755
 UMask=0077
 
 [Install]

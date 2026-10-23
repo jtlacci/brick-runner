@@ -19,6 +19,9 @@ fields are dropped. The key is never in the request: the runner adds it.
 Limits: budget.max_model_calls and budget.max_model_tokens in policy.yml, per
 run, below the runner's own. Over a limit, the run fails. An API outage
 raises a transient error: the runner records nothing and tries again later.
+
+``live_externals: [hermes]`` answers ``external:hermes`` with the Hermes agent
+(hermes.py). Hermes's own model calls go through the same budget and cache.
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ from .agent import allowed_models
 from .hashing import digest
 from .judge import Judge, JudgeError
 
-PROVIDERS = ("anthropic",)
+PROVIDERS = ("anthropic", "hermes")
 FIELDS = ("model", "max_tokens", "system", "messages", "tools", "tool_choice", "temperature", "stop_sequences")
 MAX_TOKENS = 8192
 MAX_CALLS = 2000
@@ -55,7 +58,8 @@ class LiveError(RuntimeError):
 
 class Live:
     def __init__(self, judge: Judge, names: list[str], cache: Path,
-                 max_calls: int | None = None, max_tokens: int | None = None) -> None:
+                 max_calls: int | None = None, max_tokens: int | None = None,
+                 sandbox: Any = None, evaluate_py: Path | None = None) -> None:
         unknown = [n for n in names if n not in PROVIDERS]
         if unknown:
             raise LiveError(f"live_externals names an unknown provider: {', '.join(unknown)} "
@@ -69,12 +73,64 @@ class Live:
         self.calls = 0
         self.cached = 0
         self.tokens = 0
+        self.hermes = None
+        self.evaluate_py = evaluate_py
+        if "hermes" in self.names:
+            if sandbox is None or evaluate_py is None:
+                raise LiveError("live_externals: [hermes] needs the sandbox and the brick's evaluate.py")
+            from .hermes import Hermes
+            self.hermes = Hermes(sandbox, evaluate_py, self._relayed)
+            self.relay_failure: LiveError | None = None
+            self.hermes_answers = 0
+            self.hermes_cached = 0
 
-    def answer(self, name: str, request: Any) -> dict[str, Any]:
+    def answer(self, name: str, request: Any, fixture: Any = None) -> dict[str, Any]:
         if name not in self.names:
             raise KeyError(name)
-        body = clean(request)
-        key = digest({"provider": name, "body": body})[7:]
+        if name == "hermes":
+            return self._hermes(request, fixture)
+        return self._messages(clean(request))
+
+    def _hermes(self, request: Any, fixture: Any) -> dict[str, Any]:
+        from .hermes import HermesError, cache_key
+        if not isinstance(request, dict) or not isinstance(request.get("messages"), list) or not request["messages"]:
+            raise LiveError("a Hermes request needs messages")
+        profile = request.get("profile") if isinstance(request.get("profile"), dict) else {}
+        if profile.get("model") not in allowed_models():
+            raise LiveError(f"model {profile.get('model')!r} is not allowed on this runner")
+        path = self.cache / f"hermes-{cache_key(request, fixture, self.evaluate_py)}.json"
+        if path.exists():
+            self.hermes_cached += 1
+            return json.loads(path.read_text())["answer"]
+        self.relay_failure = None
+        try:
+            answer = self.hermes.answer(request, fixture)
+        except HermesError as exc:
+            raise LiveError(f"hermes: {exc}", transient=exc.transient) from None
+        if self.relay_failure is not None and (self.relay_failure.fatal or self.relay_failure.transient):
+            raise self.relay_failure   # a budget or an outage stops the run, as for a direct model call
+        if "error" in answer:
+            raise LiveError(f"hermes: {answer['error']}")
+        self.hermes_answers += 1
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"request": request, "fixture": fixture, "answer": answer, "time": time.time()}))
+        tmp.replace(path)
+        return answer
+
+    def _relayed(self, body: Any) -> dict[str, Any]:
+        """One of Hermes's model calls (from the relay)."""
+        try:
+            return self._messages(clean(body, clamp=True))
+        except LiveError as exc:
+            self.relay_failure = exc
+            raise
+
+    def close(self) -> None:
+        if self.hermes is not None:
+            self.hermes.close()
+
+    def _messages(self, body: dict[str, Any]) -> dict[str, Any]:
+        key = digest({"provider": "anthropic", "body": body})[7:]
         path = self.cache / f"{key}.json"
         if path.exists():
             self.cached += 1
@@ -97,11 +153,15 @@ class Live:
         return answer
 
     def usage(self) -> dict[str, int]:
-        return {"model_calls": self.calls, "model_cached": self.cached, "model_tokens": self.tokens}
+        out = {"model_calls": self.calls, "model_cached": self.cached, "model_tokens": self.tokens}
+        if self.hermes is not None:
+            out.update(hermes_answers=self.hermes_answers, hermes_cached=self.hermes_cached)
+        return out
 
 
-def clean(request: Any) -> dict[str, Any]:
-    """The request as the runner sends it, or LiveError (not transient: the candidate's request is wrong)."""
+def clean(request: Any, clamp: bool = False) -> dict[str, Any]:
+    """The request as the runner sends it, or LiveError (not transient: the candidate's request is wrong).
+    ``clamp``: a max_tokens over the limit is lowered to it (Hermes asks for more than the runner allows)."""
     if not isinstance(request, dict):
         raise LiveError("a live model request must be a Messages API body (an object)")
     body = {k: request[k] for k in FIELDS if k in request}
@@ -110,6 +170,8 @@ def clean(request: Any) -> dict[str, Any]:
     if not isinstance(body.get("messages"), list) or not body["messages"]:
         raise LiveError("a live model request needs messages")
     tokens = body.get("max_tokens")
+    if clamp and isinstance(tokens, int) and not isinstance(tokens, bool) and tokens > MAX_TOKENS:
+        body["max_tokens"] = tokens = MAX_TOKENS
     if not isinstance(tokens, int) or isinstance(tokens, bool) or not 1 <= tokens <= MAX_TOKENS:
         raise LiveError(f"max_tokens must be from 1 to {MAX_TOKENS}")
     return body
