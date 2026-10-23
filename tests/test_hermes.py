@@ -199,3 +199,20 @@ class TokenCountTest(unittest.TestCase):
             live = Live(judge, ["anthropic"], Path(tmp))
             live.answer("anthropic", {"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": "x"}]})
             self.assertEqual(live.usage()["model_tokens"], 2764)
+
+
+class SmallDefectCheckTest(unittest.TestCase):
+    def test_only_hermes_bricks_get_the_small_check(self) -> None:
+        from brick_runner.engine import small_defect_check
+        self.assertTrue(small_defect_check(mock.Mock(live_externals=["hermes"])))
+        self.assertFalse(small_defect_check(mock.Mock(live_externals=["anthropic"])))
+        self.assertFalse(small_defect_check(mock.Mock(live_externals=[])))
+
+    def test_steady(self) -> None:
+        from brick_runner.engine import steady
+        # The full check: every step falls, or the caught share grows at every step.
+        self.assertTrue(steady([0.9, 0.6, 0.0], [0.25, 0.5, 1.0], 0.01, small=False))
+        self.assertFalse(steady([0.6, 0.87, 0.0], [0.5, 0.25, 1.0], 0.01, small=False))
+        # The small check compares the ends only.
+        self.assertTrue(steady([0.6, 0.87, 0.0], [1, 0, 1], 0.01, small=True))
+        self.assertFalse(steady([0.2, 0.1, 0.5], [1, 1, 1], 0.01, small=True))

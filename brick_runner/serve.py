@@ -411,7 +411,9 @@ def render_evaluation(brick: str, change: dict[str, Any]) -> str:
     parts = [
         f"#### {_code(brick)} (evaluation loop)",
         f"Defect check: {'✅ passed' if check.get('passed') else '❌ failed'}: {_escape(check.get('reason'))}. "
-        f"Baseline {_escape(check.get('metric'))}: {_number(check.get('baseline'))}.",
+        f"Baseline {_escape(check.get('metric'))}: {_number(check.get('baseline'))}."
+        + (" Small check (a live agent answers): one mutant for each strength, a third of the cases; "
+           "the strongest must score no higher than the weakest." if check.get("small") else ""),
         "\n".join(rows)]
     if cases:
         parts.append(f"Cases that catch a mutant: {_number(cases.get('caught'))} of {_number(cases.get('scored'))} "
