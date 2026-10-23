@@ -35,6 +35,24 @@ from .workspace import Overlay, Workspace
 SYNTHETIC_TIME = "1970-01-01T00:00:00+00:00"
 DEFECT_STRENGTHS = (1, 2, 4)
 DEFECT_SEEDS = (0, 1, 2, 3)
+# A brick answered by a live agent (live_externals: [hermes]) pays for every mutant's cases with live
+# runs: its defect check uses one mutant for each strength, on a fixed third of the development cases.
+SMALL_DEFECT_SEEDS = (0,)
+SMALL_DEFECT_SAMPLE = 3
+
+
+def small_defect_check(policy) -> bool:
+    return "hermes" in policy.live_externals
+
+
+def steady(medians: list, shares: list, tolerance: float, small: bool) -> bool:
+    """Do scores fall as defects grow? With one mutant for each strength, only the ends are compared:
+    the strongest mutant scores no higher than the weakest. Otherwise the medians fall at each step,
+    or the share of caught mutants grows at each step."""
+    if small:
+        return medians[-1] <= medians[0] + tolerance
+    return (all(b <= a + tolerance for a, b in zip(medians, medians[1:]))
+            or all(b >= a for a, b in zip(shares, shares[1:])))
 OPERATORS = {">=": lambda a, b: a >= b, "<=": lambda a, b: a <= b, ">": lambda a, b: a > b, "<": lambda a, b: a < b}
 LOG_LIMIT = 4000
 OBSERVE_TIMEOUT = 600          # observe with no agent, as for every other worker
@@ -208,7 +226,8 @@ class Runner:
 
     def evaluate(self, brick: str, split: str, overlays: list[Overlay], *, base: str | None = None,
                  freeze: str | None = None, kind: str = "trial", tags: dict[str, Any] | None = None,
-                 cache: bool = True, ws: Workspace | None = None, rerun_reason: str | None = None) -> dict[str, Any]:
+                 cache: bool = True, ws: Workspace | None = None, rerun_reason: str | None = None,
+                 sample: int | None = None) -> dict[str, Any]:
         base = base or self.base()
         policy = load_policy(self.repo, base, brick)
         own = ws is None
@@ -216,6 +235,9 @@ class Runner:
         try:
             dataset_key, pinned, runs = self.dataset(brick, base, ws, policy)
             chosen = splits.assign(runs, policy.split, freeze)[split]
+            if sample:
+                # A fixed share of the cases (the small defect check): the same cases for every mutant.
+                chosen = [r for r in chosen if int(digest(r["id"])[7:15], 16) % sample == 0]
             if split == splits.HOLDOUT and policy.split["kind"] == "time":
                 seen = {c["id"] for c in chosen}
                 chosen += [self.store.expand(r) for r in self.store.query(kind="run", brick=brick, source="live")
@@ -228,7 +250,7 @@ class Runner:
                 return {"status": "waiting", "have": len(chosen), "need": policy.split["min_holdout"]}
             evidence = digest(sorted([r["id"] for r in chosen] + [e["id"] for r in chosen for e in r["exchanges"]]))
             identity = {"brick": brick, "split": split, "hashes": ws.hashes, "dataset": dataset_key,
-                        "evidence": evidence, "seeds": policy.seeds,
+                        "evidence": evidence, "seeds": policy.seeds, "sample": sample,
                         "policy": self.repo.tree(base, f"bricks/{brick}/evaluation/policy.yml")}
             if self.kind(base, brick) == "web":
                 identity["toolchain"] = web.toolchain()
@@ -655,11 +677,15 @@ class Runner:
         overlays = [Overlay(brick, CODE, impl_commit), Overlay(brick, EVALUATION, eval_commit)]
         eval_tree = self.repo.tree(eval_commit, f"bricks/{brick}/evaluation")
         with self.exclusive(), workspace.build(self.repo, base, overlays, brick) as ws:
-            baseline = self.evaluate(brick, splits.DEVELOPMENT, overlays, base=base, ws=ws, kind="defect-baseline")
+            small = small_defect_check(policy)
+            seeds = SMALL_DEFECT_SEEDS if small else DEFECT_SEEDS
+            sample = SMALL_DEFECT_SAMPLE if small else None
+            baseline = self.evaluate(brick, splits.DEVELOPMENT, overlays, base=base, ws=ws, kind="defect-baseline",
+                                     sample=sample)
             base_value = baseline["terms"].get(policy.metric)
             report: dict[str, Any] = {"brick": brick, "impl_commit": impl_commit, "eval_commit": eval_commit,
                                       "eval_tree": eval_tree, "metric": policy.metric, "baseline": base_value,
-                                      "strengths": {}}
+                                      "strengths": {}, "small": small}
             brick_dir = ws.code / "bricks" / brick
             if base_value is None:
                 report.update(passed=False, reason=f"the baseline has no {policy.metric!r} term")
@@ -674,7 +700,7 @@ class Runner:
                 mutants = 0
                 for strength in DEFECT_STRENGTHS:
                     raw[strength] = []
-                    for seed in DEFECT_SEEDS:
+                    for seed in seeds:
                         code = Path(tempfile.mkdtemp(prefix="brick-mutant-"))
                         mutant = ws.with_code(code)
                         try:
@@ -682,7 +708,7 @@ class Runner:
                             mutate.mutate(code / "bricks" / brick, strength, seed * 1000 + strength)
                             mutant.hashes = workspace.component_hashes(self.repo, mutant)
                             result = self.evaluate(brick, splits.DEVELOPMENT, overlays, base=base, ws=mutant,
-                                                   kind="defect-mutant")
+                                                   kind="defect-mutant", sample=sample)
                             if any(r.startswith("the web build failed") for r in result.get("reasons", [])):
                                 unbuildable[strength] += 1   # neither caught nor missed
                                 continue
@@ -714,13 +740,12 @@ class Runner:
                 # "Scores fall as defects grow": the medians fall, or the share of mutants caught
                 # grows. With few mutants for each strength, one mutant that breaks many cases
                 # moves a median a lot, so either measure is enough.
-                monotonic = (all(b <= a + tolerance for a, b in zip(medians, medians[1:]))
-                             or all(b >= a for a, b in zip(shares, shares[1:])))
+                monotonic = steady(medians, shares, tolerance, small)
                 strongest = report["strengths"][str(DEFECT_STRENGTHS[-1])]
                 below = medians[-1] < base_value - tolerance
                 enough = strongest["detected"] * 2 >= strongest["of"]
                 # Most mutants must build: otherwise the check measures the build, not the evaluation.
-                built = all(len(raw[s]) * 2 >= len(DEFECT_SEEDS) for s in DEFECT_STRENGTHS)
+                built = all(len(raw[s]) * 2 >= len(seeds) for s in DEFECT_STRENGTHS)
                 dead = sorted(case for case, n in caught.items() if n == 0)
                 report["cases"] = {"scored": len(base_cases), "mutants": mutants, "dead": len(dead),
                                    "dead_ids": dead[:200], "caught": sum(1 for n in caught.values() if n)}
