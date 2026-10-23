@@ -187,3 +187,15 @@ class JudgeCallsTest(unittest.TestCase):
                                 'def judge_requests(record, output):\n'
                                 '    return [{"prompt": "ok"}]\n')
         self.assertEqual(result["requests"], [[{"prompt": "ok"}]])
+
+
+class TokenCountTest(unittest.TestCase):
+    def test_cached_prompt_tokens_count(self) -> None:
+        judge = mock.Mock()
+        judge.post.return_value = {"content": [], "usage": {"input_tokens": 4, "output_tokens": 60,
+                                                            "cache_creation_input_tokens": 100,
+                                                            "cache_read_input_tokens": 2600}}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"BRICK_RUNNER_AGENT_MODELS": "m"}):
+            live = Live(judge, ["anthropic"], Path(tmp))
+            live.answer("anthropic", {"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": "x"}]})
+            self.assertEqual(live.usage()["model_tokens"], 2764)
