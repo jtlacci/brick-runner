@@ -5,12 +5,17 @@ argv[1] is the Hermes checkout. HERMES_HOME holds the runner's config.yaml and
 127.0.0.1:8099 -> the Unix socket model.sock beside it (the sandbox has no
 network), then answers one request on each stdin line, one JSON line on stdout:
 
-    {"op": "reply", "system", "messages", "soul"} -> {"text", "steps", "tools"} or {"error"}
+    {"op": "reply", "system", "messages", "soul", "now"} -> {"text", "steps", "tools"} or {"error"}
+
+With "now" (ISO 8601 with an offset), Hermes's clock (hermes_time.now) is that
+moment for the request, so its prompt names the day the case is set in.
 
 It builds the agent as Hermes's API server does (gateway.run's helpers and the
 api_server platform toolsets), so the evaluation runs the same agent as CHIP.
 """
 
+from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -78,6 +83,8 @@ def main() -> None:
     if not any(name.startswith("mcp__chip__") for name in discovered or []):
         _say({"error": f"the fixture tools did not connect (found {sorted(discovered or [])[:10]})"})
         return
+    import hermes_time
+    real_now = hermes_time.now
     _say({"ready": True})
     home = Path(os.environ["HERMES_HOME"])
     for line in sys.stdin:
@@ -90,6 +97,20 @@ def main() -> None:
             if not messages or messages[-1].get("role") != "user":
                 _say({"error": "the last message must be from the user"})
                 continue
+            moment = None
+            try:
+                moment = datetime.fromisoformat(str(request.get("now") or "").replace("Z", "+00:00"))
+            except ValueError:
+                pass
+            session_id = None
+            if moment is not None and moment.tzinfo is not None:
+                hermes_time.now = lambda moment=moment: moment
+                # The session id embeds its start time ("Conversation started:" in the prompt): the case's time,
+                # and a hash of the request, so it is stable for the cache and unique for each case.
+                digest = hashlib.sha256(line.encode()).hexdigest()[:8]
+                session_id = f"{moment.strftime('%Y%m%d_%H%M%S')}_{digest}"
+            else:
+                hermes_time.now = real_now
             config = _load_gateway_config()
             runtime = _resolve_runtime_agent_kwargs()
             model = runtime.pop("model", None) or _resolve_gateway_model()
@@ -110,6 +131,7 @@ def main() -> None:
                             ephemeral_system_prompt=str(request.get("system") or "") or None,
                             enabled_toolsets=sorted(_get_platform_tools(config, "api_server")),
                             platform="api_server", tool_start_callback=start, tool_complete_callback=done,
+                            **({"session_id": session_id} if session_id else {}),
                             session_db=None, skip_memory=True)
             result = agent.run_conversation(
                 user_message=messages[-1].get("content", ""),

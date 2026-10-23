@@ -146,7 +146,9 @@ class Live:
             # A refused request (HTTP 400) is the candidate's; an outage is not.
             raise LiveError(str(exc), transient=exc.transient) from None
         usage = answer.get("usage") if isinstance(answer.get("usage"), dict) else {}
-        self.tokens += int(usage.get("input_tokens", 0) or 0) + int(usage.get("output_tokens", 0) or 0)
+        # Cached prompt tokens count too: with prompt caching most input tokens are in these two fields.
+        self.tokens += sum(int(usage.get(k, 0) or 0) for k in ("input_tokens", "output_tokens",
+                                                              "cache_creation_input_tokens", "cache_read_input_tokens"))
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps({"request": body, "answer": answer, "time": time.time()}))
         tmp.replace(path)

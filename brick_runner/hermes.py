@@ -6,7 +6,7 @@ A brick's policy.yml names it:
 
 The brick calls ``external:hermes`` with a request of this shape:
 
-    {"system": text, "messages": [OpenAI chat messages, people as "user"],
+    {"system": text, "messages": [OpenAI chat messages, people as "user"], "now": <ISO 8601 with offset>,
      "profile": {"commit": <40 hex>, "model": <allowed model>, "soul": text}}
 
 and gets {"text", "steps": [{tool, label}]} back. When a case has no recording
@@ -26,6 +26,8 @@ at the commit the request names:
   "chip"), which answer from the case's ``_fixture`` with ``evaluate.py``'s
   ``HERMES_TOOLS`` and ``tool_call(fixture, name, args)``. No web, terminal,
   files, code, memory, browser or delegation.
+- Hermes's clock is the request's "now" (the time the case is set in): its
+  prompt names the day, and the answers must agree with the case's data.
 - The response also has "tools": [{name, args, result}], for score(); the
   brick's adapter ignores it.
 
@@ -57,7 +59,7 @@ COMMIT = re.compile(r"^[0-9a-f]{40}$")
 PYTHON_VERSION = "3.14"
 UV_VERSION = "0.11.32"
 EXTRAS = ("messaging", "mcp", "anthropic")
-CONFIG_VERSION = 1                    # bump when the config below changes: it is part of every cache key
+CONFIG_VERSION = 2                    # bump when the config below changes: it is part of every cache key
 TURN_TIMEOUT = 300                    # seconds for one answer
 MAX_ITERATIONS = 12
 WORKERS = Path(__file__).resolve().parent / "workers"
@@ -255,7 +257,7 @@ class Hermes:
                 self._start(commit, model)
             (self.work / "fixture.json").write_text(json.dumps(fixture if isinstance(fixture, dict) else {}))
             message = {"op": "reply", "system": request.get("system", ""), "messages": request.get("messages", []),
-                       "soul": profile.get("soul", "")}
+                       "soul": profile.get("soul", ""), "now": request.get("now")}
             self.process.stdin.write(json.dumps(message) + "\n")
             self.process.stdin.flush()
             return self._read(time.monotonic() + TURN_TIMEOUT)
